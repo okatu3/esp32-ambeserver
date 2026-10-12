@@ -1,0 +1,23 @@
+# ESP-IDF build output and generated config
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+build.log
+
+# Analysis recordings (own voice / other stations) - not published
+*.wav
+*.refpitch
+*.m4a
+
+# Host test build artifacts
+tools/host_test/test_cli
+tools/host_test/test_cli.exe
+*.pdb
+*.obj
+
+# Upstream history of the vendored mbelib-neo (kept locally, not part of this repo)
+components/mbelib_neo/vendor/mbelib-neo/.git_upstream/
+
+# Empty git repo that was inside main/ (renamed, kept locally)
+main/.git_unused/

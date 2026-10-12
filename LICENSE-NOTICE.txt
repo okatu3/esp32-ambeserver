@@ -1,0 +1,11 @@
+This package contains original integration code plus build files. It does not bundle mbelib-neo.
+
+mbelib-neo (fetched by tools/get_mbelib.sh):
+  https://github.com/arancormonk/mbelib-neo
+  License: GPL-2.0-or-later.  A firmware binary that links it is distributed under that license.
+  Upstream also carries a patent notice for the AMBE/IMBE algorithms; check it before distributing.
+
+AMBETools (protocol reference, not included):
+  https://github.com/g4klx/AMBETools   License: GPL-2.0-or-later
+
+esp_tinyusb (pulled by the ESP component manager on ESP32-S2/S3): Apache-2.0
