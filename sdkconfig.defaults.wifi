@@ -11,3 +11,6 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y
 
 # (lwIP defaults are fine for one TCP client; sockets: listen + 1 client)
+
+# Keep network processing on core 0; the DV3000 server/codec task is pinned to core 1.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y

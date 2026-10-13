@@ -89,7 +89,7 @@ menu "AMBE3000 compat firmware"
 
     config AMBE_BENCH_LOG
         bool "Log encode/decode time per frame (to the console, never to the protocol link)"
-        default y
+        default n
 
     config AMBE_BENCH_INTERVAL
         int "Frames between benchmark log lines"

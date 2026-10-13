@@ -16,6 +16,10 @@ void dv3000_protocol_init(dv3000_tx_fn tx);
  * so half a packet of the previous session can never corrupt the next one. */
 void dv3000_protocol_reset_stream(void);
 
+/* PCM->AMBE processing time since the last call (then reset): frames, average/max total, average NR and
+ * average encoder time, in microseconds. */
+void dv3000_get_proc_stats(uint32_t *frames, uint32_t *avg_us, uint32_t *max_us, uint32_t *nr_us, uint32_t *enc_us);
+
 /* Feed raw bytes from the host in chunks of any size (1..N bytes, several packets at once). */
 void dv3000_protocol_feed(const uint8_t *data, size_t len);
 

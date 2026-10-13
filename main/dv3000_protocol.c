@@ -54,6 +54,7 @@ extern int mbe_ambe2400_enc_mag_mode;
 extern float mbe_ambe2400_enc_v_hi, mbe_ambe2400_enc_v_lo;
 extern int mbe_ambe2400_enc_vcut_hi, mbe_ambe2400_enc_vcut_lo, mbe_ambe2400_enc_vcut_force;
 extern float mbe_ambe2400_enc_octave_ratio, mbe_ambe2400_enc_octave_min, mbe_ambe2400_enc_uv_below;
+extern const short* mbe_ambe2400_enc_pitch_pcm;
 #endif
 
 #define DSTAR_BLOCK       9
@@ -117,6 +118,10 @@ static int s_gate_hang_frames = 10;  /* frames kept open after the last loud fra
 static bool s_gate_direct = true;          /* closed gate -> send the AMBE silence frame at once (F2 id 11) */
 static bool s_gate_prev_open;        /* gate decision of the previous input frame (NR delay alignment) */
 static float s_lim_gain;             /* current limiter gain (0 = not started) */
+static bool s_pitch_pre_nr = true;   /* search the pitch before noise reduction (F2 id 19) */
+static bool s_eq_enable = true;      /* automatic equaliser inside the NR (F2 id 20) */
+static float s_eq_limit = 8.0f;      /* its max correction per band, dB (F2 id 21) */
+static int16_t s_pre_prev[AUDIO_SAMPLES], s_pitch_src[AUDIO_SAMPLES];
 #define GATE_HANG      s_gate_hang_frames
 static float s_floor;              /* 0 = not initialised */
 static int s_gate_hang;
@@ -296,6 +301,10 @@ static void handle_control(const uint8_t *p, size_t n)
             case 16: mbe_ambe2400_enc_octave_ratio = (float)v / 100.0f; break;
             case 17: mbe_ambe2400_enc_uv_below = (float)v / 100.0f; break;
             case 18: mbe_ambe2400_enc_octave_min = (float)v / 100.0f; break;
+            case 19: s_pitch_pre_nr = (v != 0); break;
+            case 20: s_eq_enable = (v != 0); nr_set_auto_eq(s_eq_enable, s_eq_limit); break;
+            case 21: s_eq_limit = (float)v; nr_set_auto_eq(s_eq_enable, s_eq_limit); break;
+            case 22: nr_set_eq_blend((float)v / 100.0f); break;   /* EQ target: 0 natural .. 100 others */
             default: break;
             }
             static const uint8_t ok = 0x00;
@@ -312,6 +321,7 @@ static void handle_control(const uint8_t *p, size_t n)
         s_gate_prev_open = false;
         s_shelf_hp = s_shelf_x1 = 0.0f;
         s_lim_gain = 0.0f;
+        memset(s_pre_prev, 0, sizeof(s_pre_prev));
         s_hpf_x1 = s_hpf_x2 = s_hpf_y1 = s_hpf_y2 = 0.0f;
         nr_reset();
         ambe_codec_reset();
@@ -340,12 +350,43 @@ static void handle_control(const uint8_t *p, size_t n)
     }
 }
 
+/* Processing-time statistics (PCM -> AMBE), shown by the console 'status' command. */
+#ifdef ESP_PLATFORM
+#include "esp_timer.h"
+#define NOW_US() esp_timer_get_time()
+#else
+#define NOW_US() 0
+#endif
+static struct { int64_t sum_tot, sum_nr, sum_enc; int32_t max_tot; uint32_t n; } s_pt;
+
+void dv3000_get_proc_stats(uint32_t *frames, uint32_t *avg_us, uint32_t *max_us, uint32_t *nr_us, uint32_t *enc_us)
+{
+    uint32_t n = s_pt.n ? s_pt.n : 1;
+    *frames = s_pt.n;
+    *avg_us = (uint32_t)(s_pt.sum_tot / n);
+    *max_us = (uint32_t)s_pt.max_tot;
+    *nr_us = (uint32_t)(s_pt.sum_nr / n);
+    *enc_us = (uint32_t)(s_pt.sum_enc / n);
+    memset(&s_pt, 0, sizeof(s_pt));
+}
+
+static void pt_add(int64_t t0, int64_t nr_us, int64_t enc_us)
+{
+    int32_t tot = (int32_t)(NOW_US() - t0);
+    s_pt.sum_tot += tot;
+    s_pt.sum_nr += nr_us;
+    s_pt.sum_enc += enc_us;
+    if (tot > s_pt.max_tot) s_pt.max_tot = tot;
+    s_pt.n++;
+}
+
 static void handle_audio(const uint8_t *p, size_t n)
 {
     if (n != 2 + AUDIO_BYTES || p[0] != 0x00 || p[1] != 0xA0) {
         DV_LOGW("Bad AUDIO packet length=%u", (unsigned)n);
         return;
     }
+    int64_t t0 = NOW_US(), t_nr = 0, t_enc;
 
     int16_t pcm[AUDIO_SAMPLES];
     for (int i = 0; i < AUDIO_SAMPLES; ++i) {
@@ -364,9 +405,22 @@ static void handle_audio(const uint8_t *p, size_t n)
     }
     s_gate_prev_open = open_now;
 #endif
+    /* Pitch source: the frame BEFORE noise reduction, delayed one frame like the NR output (spectral
+     * subtraction weakens the fundamental; pitch searched on the NR output was an octave too high on 7 % of
+     * the voiced frames of a real microphone stream, vs 1.3 % before NR). Spectrum/voicing still use the
+     * noise-reduced signal. */
+    int16_t pre_nr[AUDIO_SAMPLES];
+    memcpy(pre_nr, pcm, sizeof(pre_nr));
     if (s_nr_on) {
+        int64_t t = NOW_US();
         nr_process(pcm);
+        t_nr = NOW_US() - t;
     }
+#ifdef ESP_PLATFORM
+    memcpy(s_pitch_src, s_pre_prev, sizeof(s_pitch_src));
+    memcpy(s_pre_prev, pre_nr, sizeof(s_pre_prev));
+    mbe_ambe2400_enc_pitch_pcm = (s_nr_on && s_pitch_pre_nr) ? s_pitch_src : NULL;
+#endif
     if (s_shelf_gain != 0.0f) {
         for (int i = 0; i < AUDIO_SAMPLES; ++i) {
             float x = (float)pcm[i];
@@ -385,7 +439,9 @@ static void handle_audio(const uint8_t *p, size_t n)
              * send the standard silence frame immediately instead, but keep feeding the encoder zeros so
              * its history/AGC state follows the gap. */
             uint8_t dummy[DSTAR_BLOCK];
+            t_enc = NOW_US();
             ambe_encode_dstar(pcm, dummy);
+            pt_add(t0, t_nr, NOW_US() - t_enc);
             send_ambe(DSTAR_SILENCE);
             return;
         }
@@ -415,9 +471,11 @@ static void handle_audio(const uint8_t *p, size_t n)
     }
 
     uint8_t ambe[DSTAR_BLOCK];
+    t_enc = NOW_US();
     if (!ambe_encode_dstar(pcm, ambe)) {
         memcpy(ambe, DSTAR_SILENCE, DSTAR_BLOCK);   /* always answer */
     }
+    pt_add(t0, t_nr, NOW_US() - t_enc);
     send_ambe(ambe);
 
 #ifdef ESP_PLATFORM
@@ -491,7 +549,7 @@ void dv3000_protocol_init(dv3000_tx_fn tx_fn)
     s_packet_len = 0;
     nr_init();
     /* Defaults chosen in listening tests (computed exactly like the F2 command does). */
-    s_shelf_gain = powf(10.0f, 6.0f / 20.0f) - 1.0f;
+    s_shelf_gain = 0.0f;   /* fixed +6 dB high shelf replaced by the automatic equaliser (noise_reduce.c) */
     s_pre_gain = powf(10.0f, 6.0f / 20.0f);   /* +6 dB: +12 dB over-drove the encoder (Peanut test: 0 > +6 > +12 dB for quality, +6 dB matches other stations in loudness) */
 }
 

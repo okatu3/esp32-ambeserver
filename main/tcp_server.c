@@ -254,8 +254,11 @@ static void server_task(void *arg)
 
 void tcp_server_start(uint16_t port)
 {
-    /* The codec runs in this task: same 16 KB stack as the serial protocol task. */
-    if (xTaskCreate(server_task, "dv3000_tcp", 16384, (void *)(uintptr_t)port, 5, NULL) != pdPASS) {
+    /* The codec runs in this task: same 16 KB stack as the serial protocol task. Pinned to the core the Wi-Fi
+     * stack does not use (Wi-Fi/lwIP run on core 0) with a higher priority, so a ~10 ms encode is not
+     * preempted by network work; otherwise frames of a burst queued behind it and the audio broke up. */
+    BaseType_t core = (portNUM_PROCESSORS > 1) ? 1 : 0;
+    if (xTaskCreatePinnedToCore(server_task, "dv3000_tcp", 16384, (void *)(uintptr_t)port, 10, NULL, core) != pdPASS) {
         DV_LOGE("could not create the TCP server task");
     }
 }
