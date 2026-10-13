@@ -45,16 +45,32 @@ menu "AMBE3000 compat firmware"
         depends on AMBE_TRANSPORT_UART
         default -1
 
+    choice AMBE_CLI_PORT
+        prompt "Setup console port"
+        depends on AMBE_TRANSPORT_WIFI_TCP
+        default AMBE_CLI_USB_SERIAL_JTAG if SOC_USB_SERIAL_JTAG_SUPPORTED
+        default AMBE_CLI_UART
+        help
+            Where the setup console (setup / show / status ...) runs. Small ESP32-S3/C3 boards often have only
+            the chip's built-in USB connector (USB Serial/JTAG); boards with a USB-UART bridge can use the UART.
+
+        config AMBE_CLI_USB_SERIAL_JTAG
+            bool "Built-in USB Serial/JTAG (single-connector ESP32-S3/C3/... boards)"
+            depends on SOC_USB_SERIAL_JTAG_SUPPORTED
+        config AMBE_CLI_UART
+            bool "UART (USB-UART bridge connector)"
+    endchoice
+
     config AMBE_CLI_UART_NUM
         int "Setup console UART number"
-        depends on AMBE_TRANSPORT_WIFI_TCP
+        depends on AMBE_CLI_UART
         default 0
         help
             The UART wired to the USB-UART bridge (UART0 on most DevKits). This is the COM port you open on the PC.
 
     config AMBE_CLI_BAUD
         int "Setup console baud rate"
-        depends on AMBE_TRANSPORT_WIFI_TCP
+        depends on AMBE_CLI_UART
         default 115200
 
     config AMBE_NOISE_GATE

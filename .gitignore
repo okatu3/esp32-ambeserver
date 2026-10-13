@@ -21,3 +21,8 @@ components/mbelib_neo/vendor/mbelib-neo/.git_upstream/
 
 # Empty git repo that was inside main/ (renamed, kept locally)
 main/.git_unused/
+
+# ESP32-S3 build (idf.py -B build_s3 -D SDKCONFIG=sdkconfig.s3)
+build_s3/
+sdkconfig.s3
+

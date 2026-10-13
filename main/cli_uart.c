@@ -1,31 +1,94 @@
-/* Setup console on a UART (what the PC sees as the COM port). */
+/* Setup console on the serial port the PC sees as a COM port: a UART (USB-UART bridge) or, on chips that
+ * have one (ESP32-S3/C3/...), the built-in USB Serial/JTAG port (boards with a single USB connector). */
 #include "cli_uart.h"
 
 #include <stdio.h>
 #include <string.h>
 
-#include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
+#if CONFIG_AMBE_CLI_USB_SERIAL_JTAG
+#include "driver/usb_serial_jtag.h"
+#else
+#include "driver/uart.h"
+#define CLI_UART ((uart_port_t)CONFIG_AMBE_CLI_UART_NUM)
+#endif
+
 #include "app_config.h"
 #include "cli_core.h"
 #include "tcp_server.h"
 #include "wifi_net.h"
 
-#define CLI_UART ((uart_port_t)CONFIG_AMBE_CLI_UART_NUM)
-
 static cli_t s_cli;
 static uint16_t s_run_port;      /* port the server is actually bound to (unsaved edits don't change it) */
 
-/* ---------------------------------------------------------------- terminal I/O */
+/* ---------------------------------------------------------------- port backend */
+#if CONFIG_AMBE_CLI_USB_SERIAL_JTAG
+static void io_raw(const char *s, size_t n)
+{
+    /* Short timeout: with no terminal open the host does not drain the FIFO and a blocking write would
+     * stall the console task. */
+    usb_serial_jtag_write_bytes(s, n, pdMS_TO_TICKS(50));
+}
+
+static bool io_getc(uint8_t *ch)
+{
+    return usb_serial_jtag_read_bytes(ch, 1, portMAX_DELAY) == 1;
+}
+
+static void io_flush(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(200));      /* let the host fetch the last bytes before a reboot */
+}
+
+static bool io_port_init(void)
+{
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    cfg.rx_buffer_size = 1024;
+    cfg.tx_buffer_size = 2048;
+    return usb_serial_jtag_driver_install(&cfg) == ESP_OK;
+}
+#else
 static void io_raw(const char *s, size_t n)
 {
     uart_write_bytes(CLI_UART, s, n);
 }
+
+static bool io_getc(uint8_t *ch)
+{
+    return uart_read_bytes(CLI_UART, ch, 1, portMAX_DELAY) == 1;
+}
+
+static void io_flush(void)
+{
+    uart_wait_tx_done(CLI_UART, pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static bool io_port_init(void)
+{
+    const uart_config_t uc = {
+        .baud_rate = CONFIG_AMBE_CLI_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    if (uart_driver_install(CLI_UART, 1024, 2048, 0, NULL, 0) != ESP_OK ||
+        uart_param_config(CLI_UART, &uc) != ESP_OK) {
+        return false;
+    }
+    uart_set_pin(CLI_UART, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    return true;
+}
+#endif
+
+/* ---------------------------------------------------------------- terminal I/O */
 
 static void io_puts(const char *s)
 {
@@ -55,7 +118,7 @@ static int io_readline(const char *prompt, char *buf, size_t n, bool secret)
     io_puts(prompt);
     for (;;) {
         uint8_t ch;
-        if (uart_read_bytes(CLI_UART, &ch, 1, portMAX_DELAY) != 1) {
+        if (!io_getc(&ch)) {
             continue;
         }
         if (esc == 1) {                       /* ESC [ ... : swallow cursor keys etc. */
@@ -118,8 +181,7 @@ static bool op_erase(void)                 { return app_config_erase(); }
 
 static void op_reboot(void)
 {
-    uart_wait_tx_done(CLI_UART, pdMS_TO_TICKS(500));
-    vTaskDelay(pdMS_TO_TICKS(100));
+    io_flush();
     esp_restart();
 }
 
@@ -171,20 +233,10 @@ static void cli_task(void *arg)
 
 void cli_uart_start(const app_config_t *cfg)
 {
-    const uart_config_t uc = {
-        .baud_rate = CONFIG_AMBE_CLI_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    if (uart_driver_install(CLI_UART, 1024, 2048, 0, NULL, 0) != ESP_OK ||
-        uart_param_config(CLI_UART, &uc) != ESP_OK) {
-        ESP_LOGE("cli", "UART driver setup failed");
+    if (!io_port_init()) {
+        ESP_LOGE("cli", "console port driver setup failed");
         return;
     }
-    uart_set_pin(CLI_UART, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
     s_run_port = cfg->port;
     cli_init(&s_cli, cfg, &IO, &OPS);

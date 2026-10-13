@@ -13,6 +13,12 @@ Full documentation (Japanese): [README_WIFI.md](README_WIFI.md)
 ```
 Edit the ESP-IDF and Python environment paths in `idf_env.bat` for your PC.
 
+ESP32-S3 (separate build directory; setup console on the built-in USB Serial/JTAG port):
+```
+.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.wifi" set-target esp32s3
+.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -p COM5 flash
+```
+
 ## License
 * Firmware in `main/`, `tools/`: GPL-2.0-or-later (see [LICENSE](LICENSE)).
 * `components/mbelib_neo/vendor/mbelib-neo`: mbelib-neo, GPL-2.0-or-later (see its LICENSE / LICENSES).

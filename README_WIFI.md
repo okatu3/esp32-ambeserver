@@ -34,12 +34,41 @@ PowerShell の実行ポリシーで `export.ps1` が動かない環境でも使�
   ```
   .\idf_env.bat -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.wifi" set-target esp32
   ```
-  (ESP32-S3 は `esp32s3`。S3 は UART 側=USB-UART ブリッジのコネクタの COM ポートを使います)
 * `main/Kconfig.projbuild` を変更したときは `.\idf_env.bat reconfigure` を先に実行してください(実行しないと新しい設定項目が `sdkconfig` に入りません)。
+
+### ESP32-S3 の場合
+ESP32 (無印) とは別のフォルダー(`build_s3`)・別の設定ファイル(`sdkconfig.s3`)でビルドします。両方を並べて使い分けられます。
+
+```
+.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.wifi" set-target esp32s3
+.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -p COM5 flash
+```
+(1 行目は初回だけ。COM 番号は環境に合わせてください)
+
+* ESP32 無印のボードを COM ポートに書き込もうとすると `This chip is ESP32-S3, not ESP32` などのエラーで止まります(書き込みは行われません)。チップに合ったビルドを使ってください。
+* **設定コンソールは、内蔵 USB(USB Serial/JTAG)の COM ポートに出ます**(差し込み口が 1 つだけの小型ボード向け。menuconfig の「Setup console port」で UART にも変更可)。内蔵 USB では通信速度の設定は関係ありません。起動ログも同じポートに出ます。
+* `apply` / `reboot` で再起動すると USB がいったん切断されるので、ターミナルを COM ポートにつなぎ直してください。
+* 書き込みファイルとアドレス(**ブートローダーが `0x0`**、無印は `0x1000`):
+
+  | ファイル | アドレス |
+  |---|---|
+  | `build_s3/bootloader/bootloader.bin` | `0x0` |
+  | `build_s3/partition_table/partition-table.bin` | `0x8000` |
+  | `build_s3/esp32_ambe3000_compat.bin` | `0x10000` |
+
+### 書き込みファイル(ESP32 無印)
+| ファイル | アドレス |
+|---|---|
+| `build/bootloader/bootloader.bin` | `0x1000` |
+| `build/partition_table/partition-table.bin` | `0x8000` |
+| `build/esp32_ambe3000_compat.bin` | `0x10000` |
+
+書き込み設定:DIO / 40 MHz / 4 MB。ESP32 は USB メモリとしては見えないので、エクスプローラーでのコピーでは書き込めません(`idf_env.bat` の `flash`、esptool、Flash Download Tool、ブラウザの Web 書き込みツールなどを使います)。
 
 ## 設定コンソール(COM ポート)
 
-**115200 bps / 8N1 / フロー制御なし**。Tera Term・PuTTY 等で開き、Enter(CR)を送ります。入力は ASCII のみです。
+ESP32 無印は UART(USB-UART ブリッジ)、ESP32-S3 は内蔵 USB の COM ポートです。
+UART の場合は **115200 bps / 8N1 / フロー制御なし**。Tera Term・PuTTY 等で開き、Enter(CR)を送ります。入力は ASCII のみです。
 `help` で一覧が出ます。初回は `setup`(対話ウィザード)が簡単です。
 
 * 文字化けする場合は、ターミナルの**漢字コード(文字コード)設定**を見直してください。Tera Term は「設定」→「設定の保存」で保存しないと、次回元に戻ります。
@@ -179,4 +208,5 @@ make -C tools/host_test -f Makefile.cli test
 ## 検証状況
 * 実機(ESP32 rev 3.1、IDF 5.1.6)で確認済み:ビルド、起動、設定コンソール、Wi-Fi 接続(DHCP)、`scan`、UDP/TCP での PRODID・VERSTRING・GAIN、AMBE↔音声の変換(1 フレームあたり UDP で約 6〜8 ms、TCP で約 8〜11 ms、Wi-Fi の往復込み)、BlueDV での受信(復号)と送信(符号化)。
 * 合成音声(雑音なし)の符号化→復号で異音がないことを確認。
-* 未確認:固定 IP での動作、長時間の連続運用、BlueDV 以外のクライアント、DVSI 製 AMBE チップでの復号との相互運用性の詳細。
+* ESP32-S3(QFN56, rev 0.2)で確認済み:ビルド、書き込み、内蔵 USB での設定コンソール(`show` / `status`)。
+* 未確認:ESP32-S3 での Wi-Fi 接続と送受信、固定 IP での動作、長時間の連続運用、BlueDV 以外のクライアント、DVSI 製 AMBE チップでの復号との相互運用性の詳細。
