@@ -23,6 +23,8 @@
 
 #include "app_config.h"
 #include "cli_core.h"
+#include "dv3000_protocol.h"
+#include "noise_reduce.h"
 #include "tcp_server.h"
 #include "wifi_net.h"
 
@@ -203,6 +205,24 @@ static void op_status(const cli_io_t *io)
         snprintf(b, sizeof(b), "Client: %u.%u.%u.%u:%u%s\n", (unsigned)(st.client_ip >> 24), (unsigned)((st.client_ip >> 16) & 255),
                  (unsigned)((st.client_ip >> 8) & 255), (unsigned)(st.client_ip & 255), (unsigned)st.client_port,
                  st.connected ? "" : " (last)");
+        io->puts(b);
+    }
+    {
+        /* automatic equaliser: correction per band (dB), low -> high (150 Hz .. 3.8 kHz) */
+        float eq[15];
+        nr_eq_info(eq);
+        int k = snprintf(b, sizeof(b), "Auto EQ (dB, 150Hz..3.8kHz):");
+        for (int i = 0; i < 15 && k < (int)sizeof(b) - 6; ++i) {
+            k += snprintf(b + k, sizeof(b) - (size_t)k, " %+.0f", (double)eq[i]);
+        }
+        snprintf(b + k, sizeof(b) - (size_t)k, "\n");
+        io->puts(b);
+    }
+    {
+        uint32_t fr, avg, mx, nr, en;
+        dv3000_get_proc_stats(&fr, &avg, &mx, &nr, &en);
+        snprintf(b, sizeof(b), "Encode time (since last status, %u frames): avg %u us (NR %u, encoder %u), max %u us  [budget 20000]\n",
+                 (unsigned)fr, (unsigned)avg, (unsigned)nr, (unsigned)en, (unsigned)mx);
         io->puts(b);
     }
     snprintf(b, sizeof(b), "Free heap: %u bytes\n", (unsigned)esp_get_free_heap_size());
