@@ -24,6 +24,8 @@
 #define CTRL_VERSTRING    0x31
 #define CTRL_RESET        0x33   /* PKT_RESET        */
 #define CTRL_RESETSOFTCFG 0x34   /* PKT_RESETSOFTCFG (what AMBETools sends with -r) */
+#define CTRL_GETCFG       0x36   /* PKT_GETCFG (BlueDV sends it every 5 s as a keepalive) */
+#define CTRL_READCFG      0x37   /* PKT_READCFG (BlueDV sends it once after a transmission) */
 #define CTRL_READY        0x39
 #define CTRL_DBG_SET      0xF0   /* private (tuning/diagnostics), see handle_control */
 #define CTRL_DBG_FRAME    0xF1
@@ -339,6 +341,15 @@ static void handle_control(const uint8_t *p, size_t n)
             DV_LOGW("RATEP for unsupported mode ignored");
         }
         break;
+
+    case CTRL_GETCFG:
+    case CTRL_READCFG: {
+        /* Answer 61 00 04 00 <36|37> cfg0 cfg1 cfg2; the real chip returns its power-up config,
+           whose values for a DV3000 are not known, so report zeros. */
+        static const uint8_t cfg[3] = { 0x00, 0x00, 0x00 };
+        send_control(p[0], cfg, sizeof(cfg));
+        break;
+    }
 
     case CTRL_RATET:
         DV_LOGW("RATET (no-FEC / DMR / ...) not supported; use AMBETools -f 1");
