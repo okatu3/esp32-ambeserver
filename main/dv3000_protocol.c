@@ -78,6 +78,19 @@ static const uint8_t DSTAR_SILENCE[DSTAR_BLOCK] = {
 static dv3000_tx_fn s_tx;
 static float s_in_gain = 1.0f, s_out_gain = 1.0f;   /* linear, set by PKT_GAIN */
 
+/* Link and input-level counters, read with the private command F4 (F4 01 = read and clear). In USB mode there
+ * is no console and the PC cannot capture the link, so this is how a session is checked afterwards.
+ * Kept across PKT_RESET. Input level is measured on the samples as received (before any gain). */
+#define CTRL_DBG_STATS    0xF4
+static struct {
+    uint32_t bytes_in, skipped, bad_hdr, bad_len;
+    uint32_t pk_ctrl, pk_audio, pk_ambe, bad_audio, tx_fail;
+    uint32_t speech_frames;      /* frames with RMS above -45 dBFS */
+    int32_t  speech_db_sum_x10;  /* sum of their RMS in 0.1 dBFS */
+    uint32_t peak, clipped;      /* largest |sample|, samples at full scale */
+    uint32_t quiet_frames;       /* frames at or below -45 dBFS */
+} s_ls;
+
 static float db_to_lin(int8_t db)
 {
     if (db < -90) db = -90;
@@ -169,6 +182,7 @@ static uint8_t s_txbuf[MAX_PACKET];
 static void tx(size_t len)
 {
     if (s_tx && !s_tx(s_txbuf, len)) {
+        s_ls.tx_fail++;
         DV_LOGE("TX failed (%u bytes dropped)", (unsigned)len);
     }
 }
@@ -225,6 +239,22 @@ static void handle_control(const uint8_t *p, size_t n)
     }
 
     switch (p[0]) {
+    case CTRL_DBG_STATS: {
+        /* Reply F4 + 14 x uint32 big endian, in the order of s_ls. */
+        const uint32_t *v = (const uint32_t *)&s_ls;
+        uint8_t out[sizeof(s_ls)];
+        for (size_t i = 0; i < sizeof(s_ls) / 4; ++i) {
+            out[i * 4] = (uint8_t)(v[i] >> 24);
+            out[i * 4 + 1] = (uint8_t)(v[i] >> 16);
+            out[i * 4 + 2] = (uint8_t)(v[i] >> 8);
+            out[i * 4 + 3] = (uint8_t)v[i];
+        }
+        if (n >= 2 && p[1] == 0x01) {
+            memset(&s_ls, 0, sizeof(s_ls));
+        }
+        send_control(CTRL_DBG_STATS, out, sizeof(out));
+        break;
+    }
     case CTRL_PRODID: {
         static const uint8_t id[] = "AMBE3000R";           /* incl. NUL, like the chip */
         send_control(CTRL_PRODID, id, sizeof(id));
@@ -394,8 +424,26 @@ static void pt_add(int64_t t0, int64_t nr_us, int64_t enc_us)
 static void handle_audio(const uint8_t *p, size_t n)
 {
     if (n != 2 + AUDIO_BYTES || p[0] != 0x00 || p[1] != 0xA0) {
+        s_ls.bad_audio++;
         DV_LOGW("Bad AUDIO packet length=%u", (unsigned)n);
         return;
+    }
+    {
+        int64_t sq = 0;
+        for (int i = 0; i < AUDIO_SAMPLES; ++i) {
+            int32_t v = (int16_t)(((uint16_t)p[2 + i * 2] << 8) | p[3 + i * 2]);
+            uint32_t a = (uint32_t)(v < 0 ? -v : v);
+            sq += (int64_t)v * v;
+            if (a > s_ls.peak) s_ls.peak = a;
+            if (a >= 32767) s_ls.clipped++;
+        }
+        float rms_db = 10.0f * log10f((float)sq / AUDIO_SAMPLES / (32768.0f * 32768.0f) + 1e-12f);
+        if (rms_db > -45.0f) {
+            s_ls.speech_frames++;
+            s_ls.speech_db_sum_x10 += (int32_t)lrintf(rms_db * 10.0f);
+        } else {
+            s_ls.quiet_frames++;
+        }
     }
     int64_t t0 = NOW_US(), t_nr = 0, t_enc;
 
@@ -547,9 +595,9 @@ static void process_packet(const uint8_t *packet, size_t total_len)
     const uint8_t *payload = packet + 4;
 
     switch (packet[3]) {
-    case TYPE_CONTROL: handle_control(payload, payload_len); break;
-    case TYPE_AUDIO:   handle_audio(payload, payload_len);   break;
-    case TYPE_AMBE:    handle_ambe(payload, payload_len);    break;
+    case TYPE_CONTROL: s_ls.pk_ctrl++;  handle_control(payload, payload_len); break;
+    case TYPE_AUDIO:   s_ls.pk_audio++; handle_audio(payload, payload_len);   break;
+    case TYPE_AMBE:    s_ls.pk_ambe++;  handle_ambe(payload, payload_len);    break;
     default:           DV_LOGW("Unknown packet type 0x%02X", packet[3]); break;
     }
 }
@@ -571,6 +619,7 @@ void dv3000_protocol_reset_stream(void)
 
 void dv3000_protocol_feed(const uint8_t *data, size_t len)
 {
+    s_ls.bytes_in += (uint32_t)len;
     while (len > 0) {
         size_t room = sizeof(s_packet) - s_packet_len;
         size_t take = len < room ? len : room;
@@ -588,6 +637,7 @@ void dv3000_protocol_feed(const uint8_t *data, size_t len)
                 ++skip;
             }
             if (skip) {
+                s_ls.skipped += (uint32_t)skip;
                 memmove(s_packet, s_packet + skip, s_packet_len - skip);
                 s_packet_len -= skip;
             }
@@ -599,6 +649,7 @@ void dv3000_protocol_feed(const uint8_t *data, size_t len)
             /* Once the type byte is here, reject impossible headers (a stray 0x61 in line noise
              * must not swallow the following packets). */
             if (s_packet_len >= 4 && s_packet[3] > TYPE_AUDIO) {
+                s_ls.bad_hdr++;
                 memmove(s_packet, s_packet + 1, s_packet_len - 1);
                 s_packet_len -= 1;
                 continue;
@@ -607,6 +658,7 @@ void dv3000_protocol_feed(const uint8_t *data, size_t len)
             size_t total = 4 + ((((size_t)s_packet[1] & LENGTH_MASK) << 8) | s_packet[2]);
 
             if (total > sizeof(s_packet)) {
+                s_ls.bad_len++;
                 DV_LOGE("Invalid packet length %u", (unsigned)total);
                 memmove(s_packet, s_packet + 1, s_packet_len - 1);   /* resync */
                 s_packet_len -= 1;

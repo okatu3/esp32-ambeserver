@@ -99,7 +99,8 @@ static void usb_mode_run(void)
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
     dv3000_protocol_init(transport_write);
-    if (xTaskCreate(protocol_task, "dv3000_usb", 16384, NULL, 5, NULL) != pdPASS) {
+    /* Same placement as the Wi-Fi server task: core 1, above the USB driver's housekeeping. */
+    if (xTaskCreatePinnedToCore(protocol_task, "dv3000_usb", 16384, NULL, 10, NULL, 1) != pdPASS) {
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
