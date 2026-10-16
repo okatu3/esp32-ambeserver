@@ -11,8 +11,12 @@
 #include "cli_uart.h"
 #include "tcp_server.h"
 #include "wifi_net.h"
-#else
+#endif
+#if !CONFIG_AMBE_TRANSPORT_WIFI_TCP || CONFIG_AMBE_USB_MODE_PIN
 #include "transport.h"
+#endif
+#if CONFIG_AMBE_USB_MODE_PIN
+#include "driver/gpio.h"
 #endif
 
 static const char *TAG = "main";
@@ -35,7 +39,7 @@ static void diagnostic_puts(const char *message)
 #define diagnostic_puts(s) ((void)0)
 #endif
 
-#if !CONFIG_AMBE_TRANSPORT_WIFI_TCP
+#if !CONFIG_AMBE_TRANSPORT_WIFI_TCP || CONFIG_AMBE_USB_MODE_PIN
 static void protocol_task(void *arg)
 {
     (void)arg;
@@ -50,8 +54,62 @@ static void protocol_task(void *arg)
 }
 #endif
 
+#if CONFIG_AMBE_USB_MODE_PIN
+/* Mode pin made (to GND) at boot = USB mode. Logging is switched off before anything else can print, because
+ * in USB mode the console COM port carries the binary protocol (gpio_config itself logs at INFO level). */
+static bool usb_mode_selected(void)
+{
+    esp_log_level_set("*", ESP_LOG_NONE);
+    const gpio_config_t io = {
+        .pin_bit_mask = 1ULL << CONFIG_AMBE_USB_MODE_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    vTaskDelay(pdMS_TO_TICKS(10));          /* let the pull-up settle */
+    bool made = gpio_get_level(CONFIG_AMBE_USB_MODE_GPIO) == 0;
+    if (!made) {
+        esp_log_level_set("*", CONFIG_LOG_DEFAULT_LEVEL);
+    }
+    return made;
+}
+
+/* Wi-Fi mode only: report every change of the mode pin on the console, so the right pin can be found by
+ * touching the jumper to it (the mode itself only changes at the next boot). */
+static void mode_pin_watch_task(void *arg)
+{
+    (void)arg;
+    int last = gpio_get_level(CONFIG_AMBE_USB_MODE_GPIO);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        int now = gpio_get_level(CONFIG_AMBE_USB_MODE_GPIO);
+        if (now != last) {
+            last = now;
+            ESP_LOGW(TAG, "mode pin GPIO%d %s", CONFIG_AMBE_USB_MODE_GPIO,
+                     now ? "OPEN (Wi-Fi mode at next boot)" : "MADE to GND (USB mode at next boot)");
+        }
+    }
+}
+
+static void usb_mode_run(void)
+{
+    if (!transport_init()) {
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    dv3000_protocol_init(transport_write);
+    if (xTaskCreate(protocol_task, "dv3000_usb", 16384, NULL, 5, NULL) != pdPASS) {
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+#endif
+
 void app_main(void)
 {
+#if CONFIG_AMBE_USB_MODE_PIN
+    bool usb_mode = usb_mode_selected();
+#endif
     diagnostic_puts("\r\nAPP: app_main entered\r\n");
     if (!ambe_codec_init()) {
         diagnostic_puts("APP: codec init failed\r\n");
@@ -60,6 +118,13 @@ void app_main(void)
     }
     diagnostic_puts("APP: codec init OK\r\n");
 
+#if CONFIG_AMBE_USB_MODE_PIN
+    if (usb_mode) {
+        usb_mode_run();                     /* no Wi-Fi, no console: the COM port is the DV3000 link */
+        return;
+    }
+    xTaskCreate(mode_pin_watch_task, "mode_pin", 3072, NULL, 1, NULL);
+#endif
 #if CONFIG_AMBE_TRANSPORT_WIFI_TCP
     /* Wi-Fi server: settings from flash, setup console on the serial port, DV3000 over TCP. */
     if (!app_config_nvs_init()) {

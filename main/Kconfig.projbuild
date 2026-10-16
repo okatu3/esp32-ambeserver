@@ -73,6 +73,22 @@ menu "AMBE3000 compat firmware"
         depends on AMBE_CLI_UART
         default 115200
 
+    config AMBE_USB_MODE_PIN
+        bool "Mode pin: DV3000 over the built-in USB port instead of Wi-Fi"
+        depends on AMBE_CLI_USB_SERIAL_JTAG
+        default y
+        help
+            The pin is read once at boot. Open (internal pull-up) = Wi-Fi server + setup console as usual.
+            Connected to GND = USB mode: Wi-Fi, the console and all log output are off and the built-in USB
+            COM port carries only the DV3000 binary protocol, like a DV3000/ThumbDV USB stick.
+
+    config AMBE_USB_MODE_GPIO
+        int "Mode pin GPIO number"
+        depends on AMBE_USB_MODE_PIN
+        default 4
+        help
+            Do not use strapping pins (0, 3, 45, 46) or the USB pins (19, 20).
+
     config AMBE_NOISE_GATE
         bool "Noise gate in front of the AMBE encoder"
         default y

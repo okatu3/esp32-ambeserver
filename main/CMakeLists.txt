@@ -6,6 +6,9 @@ set(reqs mbelib_neo driver esp_timer nvs_flash esp_wifi esp_netif esp_event lwip
 
 if(CONFIG_AMBE_TRANSPORT_WIFI_TCP)
     list(APPEND srcs cfg_parse.c cli_core.c cli_uart.c app_config_nvs.c wifi_net.c tcp_server.c)
+    if(CONFIG_AMBE_USB_MODE_PIN)
+        list(APPEND srcs transport_usj.c)
+    endif()
 elseif(CONFIG_AMBE_TRANSPORT_USB_CDC)
     list(APPEND srcs transport_usb.c)
 else()

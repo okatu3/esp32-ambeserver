@@ -11,6 +11,9 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
+#if CONFIG_AMBE_USB_MODE_PIN
+#include "driver/gpio.h"
+#endif
 #if CONFIG_AMBE_CLI_USB_SERIAL_JTAG
 #include "driver/usb_serial_jtag.h"
 #else
@@ -204,6 +207,12 @@ static void op_status(const cli_io_t *io)
     }
     snprintf(b, sizeof(b), "Free heap: %u bytes\n", (unsigned)esp_get_free_heap_size());
     io->puts(b);
+#if CONFIG_AMBE_USB_MODE_PIN
+    /* Read live, so a loose jumper can be checked without rebooting (the mode itself is chosen at boot). */
+    snprintf(b, sizeof(b), "Mode pin: GPIO%d now %s (made at boot = USB mode, open = Wi-Fi mode)\n",
+             CONFIG_AMBE_USB_MODE_GPIO, gpio_get_level(CONFIG_AMBE_USB_MODE_GPIO) ? "OPEN" : "MADE (GND)");
+    io->puts(b);
+#endif
 }
 
 static void op_scan(const cli_io_t *io) { wifi_net_scan_print(io->puts); }
