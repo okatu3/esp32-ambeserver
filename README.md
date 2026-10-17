@@ -1,32 +1,38 @@
-# ESP32 AMBE3000 (DV3000) compatible server over Wi-Fi
+# ESP32 AMBE3000 (DV3000) compatible server over Wi-Fi — `esp32` line
 
-ESP32 firmware that answers the DV3000 / AMBE-3000R serial protocol (`0x61 | len | type | payload`) over
-**UDP and TCP port 2460** (BlueDV "AMBE server" compatible), with a serial setup console for Wi-Fi settings.
-D-STAR (AMBE 3600x2400, 2400 bps voice + 1200 bps FEC) only. Codec: mbelib-neo (vendored, modified).
+ESP32 (classic DevKit) firmware that answers the DV3000 / AMBE-3000R protocol over **UDP and TCP port 2460**
+(BlueDV "AMBE server"), with a serial setup console for the Wi-Fi settings. D-STAR only.
+Codec: mbelib-neo with a **modified encoder** and pre-processing (150 Hz high-pass, noise gate, noise reduction,
+automatic equaliser, +6 dB with peak limiter).
 
-Full documentation (Japanese): [README_WIFI.md](README_WIFI.md)
+ESP32（無印）を、Wi-Fi でつなぐ AMBE サーバーにする系統です。設定（SSID、パスワード、IP アドレス）は USB の
+COM ポートの設定画面で行います。
+
+* Overview of all lines and the open problems: [docs/OVERVIEW.md](docs/OVERVIEW.md),
+  [docs/AUDIO_FINDINGS.md](docs/AUDIO_FINDINGS.md)
+* Setup console, BlueDV settings, troubleshooting (Japanese): [README_WIFI.md](README_WIFI.md)
+* Protocol and private tuning commands (F0–F3): [docs/PROTOCOL.md](docs/PROTOCOL.md)
+* Testing: [docs/TESTING.md](docs/TESTING.md), tools in `tools/audio_test/`
+* Changes per flashed version: [CHANGELOG.md](CHANGELOG.md) (tags `esp32-YYYY.MM.DD`)
 
 ## Build (ESP-IDF 5.1.6, Windows)
 ```
 .\idf_env.bat build
 .\idf_env.bat -p COM12 flash
 ```
-Edit the ESP-IDF and Python environment paths in `idf_env.bat` for your PC.
+`idf_env.bat` uses `IDF_516` (ESP-IDF folder) and `IDF_PY_ENV` (its Python environment) if set; otherwise edit the
+defaults in the file.
 
-ESP32-S3 (separate build directory; setup console on the built-in USB Serial/JTAG port):
-```
-.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.wifi" set-target esp32s3
-.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -p COM5 flash
-```
+## BlueDV
+Setup → AMBE: **AMBE server**, IP = the ESP32's address, port **2460**.
 
-## License
-* Firmware in `main/`, `tools/`: GPL-2.0-or-later (see [LICENSE](LICENSE)).
-* `components/mbelib_neo/vendor/mbelib-neo`: mbelib-neo, GPL-2.0-or-later (see its LICENSE / LICENSES).
-  The encoder (`src/ambe/ambe3600x2400_enc.c`) and `src/internal/mbe_compiler.h` contain local
-  modifications for this project (documented in README_WIFI.md).
-* Any firmware binary built from this repository is distributed under the GPL.
+## Local changes to mbelib-neo
+`components/mbelib_neo/vendor/mbelib-neo` is mbelib-neo (upstream commit `27df6dc`) with two local changes:
+* `src/internal/mbe_compiler.h`: `MBE_THREAD_LOCAL` can be defined by the build (set empty on ESP-IDF: thread-local
+  storage is copied into every task's stack and made the chip reboot at start-up)
+* `src/ambe/ambe3600x2400_enc.c`: pitch tracking (continuity, octave-down correction, separate pitch source),
+  voicing cut-offs, magnitude/smoothing options and their tuning globals (see docs/PROTOCOL.md, F0/F2)
 
-## Patent notice
-The AMBE vocoder is covered by patents held by Digital Voice Systems, Inc. (DVSI) in some jurisdictions.
-This software implementation is provided for experimentation; check the legal situation where you live
-before using or distributing it.
+## License / Patent notice
+GPL-2.0-or-later ([LICENSE](LICENSE)); mbelib-neo GPL-2.0-or-later. AMBE is covered by DVSI patents in some
+jurisdictions — for experimentation; check your local law before use or distribution.
