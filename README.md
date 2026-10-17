@@ -1,32 +1,37 @@
-# ESP32 AMBE3000 (DV3000) compatible server over Wi-Fi
+# ESP32 AMBE3000 (DV3000) compatible vocoder over USB, plain mbelib-neo — `usb-esp32` line
 
-ESP32 firmware that answers the DV3000 / AMBE-3000R serial protocol (`0x61 | len | type | payload`) over
-**UDP and TCP port 2460** (BlueDV "AMBE server" compatible), with a serial setup console for Wi-Fi settings.
-D-STAR (AMBE 3600x2400, 2400 bps voice + 1200 bps FEC) only. Codec: mbelib-neo (vendored, modified).
+Reference line: an ESP32 DevKit acts as a **DV3000 on a serial port** (the board's USB-UART bridge, **460800 bps**),
+with the **published mbelib-neo, unmodified**. No Wi-Fi, no console, no logs on the link. Only two things are added
+in front of the encoder, both in `main/dv3000_protocol.c`:
 
-Full documentation (Japanese): [README_WIFI.md](README_WIFI.md)
+1. a **noise gate** (background noise is otherwise encoded as voice: a warble between words), and
+2. **onset pitch priming** — at each word start the encoder is reset and its pitch memory is set with dry runs on a
+   tone at the period we measure, because cold it takes ~2 x the first formant for the pitch and then can only glide
+   down 25 % per frame (a chirp at every word start). See [docs/AUDIO_FINDINGS.md](docs/AUDIO_FINDINGS.md) 1.2.
+
+公開版の mbelib-neo をそのまま使い、USB だけでつなぐ、比較の基準のための系統です。
+
+* Overview and open problems: [docs/OVERVIEW.md](docs/OVERVIEW.md), [docs/AUDIO_FINDINGS.md](docs/AUDIO_FINDINGS.md)
+* Protocol: [docs/PROTOCOL.md](docs/PROTOCOL.md)
+* Testing and scoring tools: [docs/TESTING.md](docs/TESTING.md), `tools/audio_test/`
+* Changes: [CHANGELOG.md](CHANGELOG.md) (tags `usb-esp32-YYYY.MM.DD`)
 
 ## Build (ESP-IDF 5.1.6, Windows)
 ```
 .\idf_env.bat build
-.\idf_env.bat -p COM12 flash
-```
-Edit the ESP-IDF and Python environment paths in `idf_env.bat` for your PC.
-
-ESP32-S3 (separate build directory; setup console on the built-in USB Serial/JTAG port):
-```
-.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.wifi" set-target esp32s3
-.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -p COM5 flash
+.\idf_env.bat -p COM9 flash
 ```
 
-## License
-* Firmware in `main/`, `tools/`: GPL-2.0-or-later (see [LICENSE](LICENSE)).
-* `components/mbelib_neo/vendor/mbelib-neo`: mbelib-neo, GPL-2.0-or-later (see its LICENSE / LICENSES).
-  The encoder (`src/ambe/ambe3600x2400_enc.c`) and `src/internal/mbe_compiler.h` contain local
-  modifications for this project (documented in README_WIFI.md).
-* Any firmware binary built from this repository is distributed under the GPL.
+## BlueDV
+Setup → AMBE: serial DV3000 on the board's COM port, 460800 bps.
 
-## Patent notice
-The AMBE vocoder is covered by patents held by Digital Voice Systems, Inc. (DVSI) in some jurisdictions.
-This software implementation is provided for experimentation; check the legal situation where you live
-before using or distributing it.
+## Notes
+* The DevKit's auto-reset circuit holds the ESP32 in reset while **RTS alone** is asserted; after a reset the ROM
+  prints ~700 bytes of boot text at another baud rate before the firmware starts (it cannot be disabled in software).
+* `components/mbelib_neo/vendor/mbelib-neo` is upstream commit `27df6dc`; the encoder file is byte-identical to
+  upstream. The only local change is the `MBE_THREAD_LOCAL` guard in `src/internal/mbe_compiler.h` (thread-local
+  storage is copied into every task's stack on ESP-IDF and made the chip reboot at start-up).
+
+## License / Patent notice
+GPL-2.0-or-later ([LICENSE](LICENSE)); mbelib-neo GPL-2.0-or-later. AMBE is covered by DVSI patents in some
+jurisdictions — for experimentation; check your local law before use or distribution.

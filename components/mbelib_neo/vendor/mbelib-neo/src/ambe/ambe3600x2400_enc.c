@@ -85,46 +85,9 @@ struct mbe_ambe2400_encoder {
     float hist_gain;
     int silence_run;
     float prev_lag;
-    float prev_strength; /* voicing strength of the frame that set prev_lag */
-    int vstate;          /* voicing cutoff used last frame: 0 analysis, 1 = 2.5 kHz, 2 = 3.5 kHz */
-    float env[65];       /* previous voiced frame's log2 spectral envelope, 62.5 Hz grid (0..4 kHz) */
-    int env_valid;
-    float phist[AMBE2400_ENC_SAMPLES]; /* previous frame of the separate pitch source */
-    float pnow[AMBE2400_ENC_SAMPLES];  /* current frame of the pitch source */
-    int have_pnow;
     float max_energy;
     mbe_fft_plan* fft;
 };
-
-/* ESP32 port: 1 = non-overlapping harmonic bands in the spectral amplitude estimate (see
- * ambe2400_enc_spectrum), 0 = upstream. Adjustable at run time. */
-int mbe_ambe2400_enc_band_fix = 0;
-/* ESP32 port: if set by the caller before mbe_encodeAmbe2400Parms(), 160 samples (aligned with the frame
- * being encoded) that the pitch is searched on instead of the encoded signal; NULL = upstream behaviour. */
-const short* mbe_ambe2400_enc_pitch_pcm = NULL;
-/* ESP32 port: 1 = per-harmonic amplitude from the 3 bins around the band's peak only (the harmonic's main
- * lobe), leaving out the inter-harmonic bins that carry mostly noise. 0 = upstream (whole band). */
-int mbe_ambe2400_enc_mag_mode = 1;
-/* ESP32 port: voicing-strength cutoffs for "voiced to 3.5 kHz" / "voiced to 2.5 kHz" (upstream 0.60/0.40). */
-float mbe_ambe2400_enc_v_hi = 0.50f, mbe_ambe2400_enc_v_lo = 0.30f;
-/* ESP32 port: highest voiced band (jl, 500 Hz units: 7 = 3.75 kHz, 5 = 3 kHz, 3 = 2 kHz) for the two voicing
- * states, and whether bands above it are forced unvoiced. Upstream: 7 / 5 / no. A real AMBE chip voices only
- * ~half of the harmonics of voiced frames on this kind of speech, upstream ~95 %: buzzy, warbling highs. */
-int mbe_ambe2400_enc_vcut_hi = 2, mbe_ambe2400_enc_vcut_lo = 1, mbe_ambe2400_enc_vcut_force = 1; /* listening test: most natural */
-/* ESP32 port: octave-down correction threshold (strength at half lag / strength at chosen lag); 0 = off. */
-float mbe_ambe2400_enc_octave_ratio = 0.95f;
-/* ESP32 port: the octave correction only applies to clearly periodic frames (strength >= this); on
- * aperiodic frames it pushed the pitch an octave UP. */
-float mbe_ambe2400_enc_octave_min = 0.50f; /* with the pitch searched before NR (noisier, lower strengths) */
-/* ESP32 port: frames whose voicing strength is below this are coded fully unvoiced instead of trusting the
- * loose per-band peak test (which voiced loud fricatives / creaky frames at a random pitch: a buzzy "kero").
- * 0 = upstream. */
-float mbe_ambe2400_enc_uv_below = 0.35f;
-/* ESP32 port: temporal smoothing weight of the log spectral amplitudes between consecutive voiced frames
- * (0 = upstream). Noise makes the per-harmonic amplitude estimate jitter from frame to frame, heard as a
- * warble; see ambe2400_enc_smooth. 0.5 cancelled the excess spectral flux on noisy PC-microphone speech
- * and was rated at least as good as 0 in listening tests. */
-float mbe_ambe2400_enc_smooth = 0.5f;
 
 void
 mbe_ambe2400EncoderReset(mbe_ambe2400_encoder* enc) {
@@ -185,16 +148,6 @@ ambe2400_enc_spectrum(mbe_ambe2400_encoder* enc, const float* windowed, float f0
         float hi = ((float)l + 0.5f) * f0_bin;
         int lo_bin = (int)lo;
         int hi_bin = (int)hi + 1;
-        if (mbe_ambe2400_enc_band_fix) {
-            /* ESP32 port: upstream's bands overlap their neighbours by 1-2 bins, so the same energy is
-             * counted for two harmonics and the per-harmonic amplitude jitters with the fractional pitch.
-             * Here every bin belongs to exactly one band: lo <= bin < hi. */
-            lo_bin = (int)ceilf(lo);
-            hi_bin = (int)ceilf(hi) - 1;
-            if (hi_bin < lo_bin) {
-                hi_bin = lo_bin;
-            }
-        }
         float band_energy = 0.0f;
         float band_peak = 0.0f;
         int n_bins = 0;
@@ -218,27 +171,6 @@ ambe2400_enc_spectrum(mbe_ambe2400_encoder* enc, const float* windowed, float f0
         }
 
         mag[l] = sqrtf(band_energy + 1e-12f);
-        if (mbe_ambe2400_enc_mag_mode == 1 && n_bins > 3) {
-            int pk = lo_bin;
-            for (int b = lo_bin; b <= hi_bin; b++) {
-                float re = fft_out[2 * (size_t)b];
-                float im = fft_out[(2 * b) + 1];
-                if ((re * re) + (im * im) >= band_peak) {
-                    pk = b;
-                    break;
-                }
-            }
-            float lobe = 0.0f;
-            for (int b = pk - 1; b <= pk + 1; b++) {
-                if (b < 1 || b > (AMBE2400_ENC_FFT_SIZE / 2) - 1) {
-                    continue;
-                }
-                float re = fft_out[2 * (size_t)b];
-                float im = fft_out[(2 * b) + 1];
-                lobe += (re * re) + (im * im);
-            }
-            mag[l] = sqrtf(lobe + 1e-12f);
-        }
         if (band_energy > max_band_energy) {
             max_band_energy = band_energy;
         }
@@ -305,26 +237,10 @@ ambe2400_enc_refine_lag(const float amdf[128], int lag) {
     return lag_f;
 }
 
-/* Pitch-tracking tunables (ESP32 port, adjustable at run time for experiments; defaults = upstream).
- * track_strength: continuity is used only if the previous frame's voicing strength >= this (0 = always).
- * max_jump: frame-to-frame lag change limit (fraction); cont_weight: weight of the continuity term. */
-float mbe_ambe2400_enc_track_strength = 0.0f;
-float mbe_ambe2400_enc_max_jump = 0.25f;
-float mbe_ambe2400_enc_cont_weight = 0.8f;
-/* Last frame analysis, for diagnostics. */
-float mbe_ambe2400_enc_dbg_lag, mbe_ambe2400_enc_dbg_strength;
-int mbe_ambe2400_enc_dbg_b0, mbe_ambe2400_enc_dbg_vstate, mbe_ambe2400_enc_dbg_b1;
-/* Voicing hysteresis: on noisy input the voicing strength wanders around the 0.4 / 0.6 cutoffs, so the
- * voiced bandwidth flips frame to frame (buzz <-> noise), heard as a "gyuu-gyuu" warble. With hysteresis
- * a cutoff is entered at 0.6 / 0.4 but only left below 0.45 / 0.25. 0 = upstream behaviour. */
-int mbe_ambe2400_enc_vhyst = 0;
-float mbe_ambe2400_enc_agc_alpha = 1.0f; /* AGC off: it lifted the noise between words (gain +12 dB is applied before the encoder instead) */
-#define AMBE2400_ENC_TRACK_STRENGTH mbe_ambe2400_enc_track_strength
-
 static float
 ambe2400_enc_pitch_candidate(const mbe_ambe2400_encoder* enc, const float amdf[128], float global_min) {
     const float tol = global_min * 1.4f;
-    int have_prev = (enc->prev_lag >= (float)20) && (enc->prev_strength >= AMBE2400_ENC_TRACK_STRENGTH);
+    int have_prev = (enc->prev_lag >= (float)20);
 
     float best_lag_f = 20.0f;
     float best_score = 1e30f;
@@ -342,7 +258,7 @@ ambe2400_enc_pitch_candidate(const mbe_ambe2400_encoder* enc, const float amdf[1
         float score;
         if (have_prev) {
             /* AMDF quality + continuity (octave-aware). */
-            score = (amdf[lag] / (global_min + 1e-12f)) + (mbe_ambe2400_enc_cont_weight * fabsf(log2f(lag_f / enc->prev_lag)));
+            score = (amdf[lag] / (global_min + 1e-12f)) + (0.8f * fabsf(log2f(lag_f / enc->prev_lag)));
         } else {
             /* Cold start: among the tied minima, the shortest period is
              * the true fundamental (kills the octave-down error). */
@@ -366,12 +282,8 @@ ambe2400_enc_pitch_candidate(const mbe_ambe2400_encoder* enc, const float amdf[1
  * local minimum within a tolerance of the global minimum and pick among
  * them by continuity (and, on cold start, the shortest period).
  */
-/* buf: signal the pitch is searched on; sbuf: signal the final voicing strength is measured on (NULL = buf).
- * ESP32 port: the caller may search the pitch on the signal before noise reduction (sbuf = the encoded,
- * noise-reduced signal): spectral-subtraction NR weakens the fundamental and made the tracker pick half the
- * period (pitch an octave UP) on 7 % of voiced frames of a real microphone stream. */
 static float
-ambe2400_enc_pitch(mbe_ambe2400_encoder* enc, const float* buf, int n, float* strength, const float* sbuf) {
+ambe2400_enc_pitch(mbe_ambe2400_encoder* enc, const float* buf, int n, float* strength) {
     const int min_lag = 20;
     const int max_lag = 127;
     float amdf[128];
@@ -392,33 +304,11 @@ ambe2400_enc_pitch(mbe_ambe2400_encoder* enc, const float* buf, int n, float* st
     }
 
     float best_lag_f = ambe2400_enc_pitch_candidate(enc, amdf, global_min);
-    int have_prev = (enc->prev_lag >= (float)min_lag) && (enc->prev_strength >= AMBE2400_ENC_TRACK_STRENGTH);
+    int have_prev = (enc->prev_lag >= (float)min_lag);
 
-    /* ESP32 port: octave-down correction. A periodic signal repeats at 2T as well as at T; once the tracker
-     * has picked 2T, the continuity term keeps it there and the 25 % clamp then needs several frames to
-     * come back (on clean speech 11 % of voiced frames were at half the true pitch: a croaky "kero"
-     * sound). If the half lag is about as periodic as the chosen one, take it, without the clamp. */
-    int octave_fixed = 0;
-    if (mbe_ambe2400_enc_octave_ratio > 0.0f && best_lag_f >= 2.0f * (float)min_lag) {
-        float s_full = ambe2400_enc_pitch_strength(buf, n, best_lag_f);
-        int half = (int)(best_lag_f * 0.5f + 0.5f);
-        int hb = half; /* best AMDF minimum near the half lag */
-        for (int l = half - 2; l <= half + 2; l++) {
-            if (l >= min_lag && l <= max_lag && amdf[l] < amdf[hb]) {
-                hb = l;
-            }
-        }
-        float half_f = ambe2400_enc_refine_lag(amdf, hb);
-        float s_half = ambe2400_enc_pitch_strength(buf, n, half_f);
-        if (s_full >= mbe_ambe2400_enc_octave_min && s_half >= mbe_ambe2400_enc_octave_ratio * s_full) {
-            best_lag_f = half_f;
-            octave_fixed = 1;
-        }
-    }
-
-    /* Final guard: limit frame-to-frame jumps to 25% (within a voiced run only). */
-    if (have_prev && !octave_fixed && mbe_ambe2400_enc_max_jump > 0.0f) {
-        float max_jump = mbe_ambe2400_enc_max_jump * enc->prev_lag;
+    /* Final guard: limit frame-to-frame jumps to 25%. */
+    if (have_prev) {
+        float max_jump = 0.25f * enc->prev_lag;
         float diff = best_lag_f - enc->prev_lag;
         if (fabsf(diff) > max_jump) {
             best_lag_f = enc->prev_lag + (diff > 0.0f ? max_jump : -max_jump);
@@ -427,12 +317,8 @@ ambe2400_enc_pitch(mbe_ambe2400_encoder* enc, const float* buf, int n, float* st
 
     enc->prev_lag = best_lag_f;
 
-    float st = ambe2400_enc_pitch_strength(sbuf != NULL ? sbuf : buf, n, best_lag_f);
-    enc->prev_strength = st;
-    mbe_ambe2400_enc_dbg_lag = best_lag_f;
-    mbe_ambe2400_enc_dbg_strength = st;
     if (strength != NULL) {
-        *strength = st;
+        *strength = ambe2400_enc_pitch_strength(buf, n, best_lag_f);
     }
     return best_lag_f;
 }
@@ -485,26 +371,7 @@ static void
 ambe2400_enc_quantize_pitch(mbe_ambe2400_encoder* enc, struct ambe2400_enc_frame* q) {
     /* Pitch */
     q->strength = 0.0f;
-    float lag_f;
-    if (enc->have_pnow) {
-        /* Pitch-source window, aligned with q->buf: last 128 of the previous pitch frame + first 128 now. */
-        float pbuf[AMBE2400_ENC_FFT_SIZE];
-        float dc = 0.0f;
-        for (int i = 0; i < 128; i++) {
-            pbuf[i] = enc->phist[AMBE2400_ENC_SAMPLES - 128 + i];
-            pbuf[128 + i] = enc->pnow[i];
-        }
-        for (int i = 0; i < AMBE2400_ENC_FFT_SIZE; i++) {
-            dc += pbuf[i];
-        }
-        dc /= (float)AMBE2400_ENC_FFT_SIZE;
-        for (int i = 0; i < AMBE2400_ENC_FFT_SIZE; i++) {
-            pbuf[i] -= dc;
-        }
-        lag_f = ambe2400_enc_pitch(enc, pbuf, AMBE2400_ENC_FFT_SIZE, &q->strength, q->buf);
-    } else {
-        lag_f = ambe2400_enc_pitch(enc, q->buf, AMBE2400_ENC_FFT_SIZE, &q->strength, NULL);
-    }
+    float lag_f = ambe2400_enc_pitch(enc, q->buf, AMBE2400_ENC_FFT_SIZE, &q->strength);
     float f0 = 1.0f / lag_f;
 
     q->b[0] = (int)lroundf((log2f(f0) - AMBE2400_ENC_F0_OFFSET) / AMBE2400_ENC_F0_STEP - 0.5f);
@@ -515,7 +382,6 @@ ambe2400_enc_quantize_pitch(mbe_ambe2400_encoder* enc, struct ambe2400_enc_frame
         q->b[0] = 125;
     }
 
-    mbe_ambe2400_enc_dbg_b0 = q->b[0];
     q->L = mbe_clamp_harmonic_count((int)AmbePlusLtable[q->b[0]]);
     q->f0q = exp2f(AMBE2400_ENC_F0_OFFSET + (AMBE2400_ENC_F0_STEP * ((float)q->b[0] + 0.5f)));
 }
@@ -545,48 +411,26 @@ ambe2400_enc_voicing(mbe_ambe2400_encoder* enc, struct ambe2400_enc_frame* q) {
 
         float rel = frame_e / (enc->max_energy + 1e-12f);
 
-        if ((rel < 0.03f && q->strength < 0.65f) || q->strength < mbe_ambe2400_enc_uv_below) {
+        if (rel < 0.03f && q->strength < 0.65f) {
             for (int l = 1; l <= q->L; l++) {
                 q->Vl_ana[l] = 0;
             }
-            enc->vstate = 0;
         } else {
-            int state = 0;
-            if (q->strength > mbe_ambe2400_enc_v_hi) {
-                state = 2;
-            } else if (q->strength > mbe_ambe2400_enc_v_lo) {
-                state = 1;
-            }
-            if (mbe_ambe2400_enc_vhyst && state < enc->vstate) {
-                int keep = 0;
-                if (enc->vstate == 2 && q->strength >= 0.45f) {
-                    keep = 2;
-                } else if (q->strength >= 0.25f) {
-                    keep = 1;
-                }
-                if (keep > state) {
-                    state = keep;
-                }
-            }
-            enc->vstate = state;
             int max_jl = -1;
-            if (state == 2) {
-                max_jl = mbe_ambe2400_enc_vcut_hi; /* upstream 7: ~3.5 kHz, fully voiced */
-            } else if (state == 1) {
-                max_jl = mbe_ambe2400_enc_vcut_lo; /* upstream 5: ~2.5 kHz */
+            if (q->strength > 0.60f) {
+                max_jl = 7; /* ~3.5 kHz: fully voiced */
+            } else if (q->strength > 0.40f) {
+                max_jl = 5; /* ~2.5 kHz */
             }
             if (max_jl >= 0) {
                 for (int l = 1; l <= q->L; l++) {
                     int jl = (int)((float)l * 16.0f * q->f0q);
                     if (jl <= max_jl) {
                         q->Vl_ana[l] = 1;
-                    } else if (mbe_ambe2400_enc_vcut_force) {
-                        q->Vl_ana[l] = 0;
                     }
                 }
             }
         }
-        mbe_ambe2400_enc_dbg_vstate = enc->vstate;
     }
 }
 
@@ -618,7 +462,6 @@ ambe2400_enc_quantize_vuv(struct ambe2400_enc_frame* q, const mbe_parms* prev_mp
             }
         }
         q->b[1] = best_row;
-        mbe_ambe2400_enc_dbg_b1 = best_row;
     }
 }
 
@@ -894,61 +737,6 @@ ambe2400_enc_fill_parms(const struct ambe2400_enc_frame* q, mbe_parms* cur_mp) {
     cur_mp->gamma = q->gamma_q;
 }
 
-/* Previous envelope at grid position g (62.5 Hz units). */
-static float
-ambe2400_enc_env_at(const mbe_ambe2400_encoder* enc, float g) {
-    if (g <= 0.0f) {
-        return enc->env[0];
-    }
-    if (g >= 64.0f) {
-        return enc->env[64];
-    }
-    int i = (int)g;
-    float t = g - (float)i;
-    return enc->env[i] + (t * (enc->env[i + 1] - enc->env[i]));
-}
-
-/* ESP32 port: blend the log spectral amplitudes with the previous voiced frame's envelope (sampled at the
- * same frequencies, so a pitch change does not matter). Skipped on unvoiced frames and on level jumps
- * (> 6 dB on average) so onsets and transitions stay sharp. */
-static void
-ambe2400_enc_smooth(mbe_ambe2400_encoder* enc, struct ambe2400_enc_frame* q) {
-    const float w = mbe_ambe2400_enc_smooth;
-    const float grid = q->f0q * 128.0f; /* harmonic spacing in 62.5 Hz grid units */
-    const int voiced = (q->strength >= 0.4f);
-    float lg[57];
-
-    for (int l = 1; l <= q->L; l++) {
-        lg[l] = log2f(q->mag[l] + 1e-12f);
-    }
-    if (w > 0.0f && enc->env_valid && voiced) {
-        float diff = 0.0f;
-        for (int l = 1; l <= q->L; l++) {
-            diff += lg[l] - ambe2400_enc_env_at(enc, (float)l * grid);
-        }
-        if (fabsf(diff / (float)q->L) < 1.0f) {
-            for (int l = 1; l <= q->L; l++) {
-                lg[l] = ((1.0f - w) * lg[l]) + (w * ambe2400_enc_env_at(enc, (float)l * grid));
-                q->mag[l] = exp2f(lg[l]);
-            }
-        }
-    }
-    /* Store this frame's (smoothed) envelope on the grid. */
-    for (int k = 0; k <= 64; k++) {
-        float x = (float)k / grid; /* harmonic index at this frequency */
-        if (x <= 1.0f) {
-            enc->env[k] = lg[1];
-        } else if (x >= (float)q->L) {
-            enc->env[k] = lg[q->L];
-        } else {
-            int l = (int)x;
-            float t = x - (float)l;
-            enc->env[k] = lg[l] + (t * (lg[l + 1] - lg[l]));
-        }
-    }
-    enc->env_valid = voiced;
-}
-
 /* Quantize a voice frame, reconstruct its predictor state, and pack 49 bits. */
 static int
 ambe2400_encode_voice(mbe_ambe2400_encoder* enc, const float* pcm, char ambe_d[49], mbe_parms* cur_mp,
@@ -962,7 +750,6 @@ ambe2400_encode_voice(mbe_ambe2400_encoder* enc, const float* pcm, char ambe_d[4
         return status;
     }
     ambe2400_enc_voicing(enc, &q);
-    ambe2400_enc_smooth(enc, &q);
     ambe2400_enc_quantize_vuv(&q, prev_mp);
     ambe2400_enc_quantize_gain(&q, prev_mp);
     ambe2400_enc_prediction(&q, prev_mp);
@@ -1032,14 +819,8 @@ ambe2400_enc_apply_agc(mbe_ambe2400_encoder* enc, const float* samples, float rm
     /* Input AGC: track level only on speech frames, normalize to the
      * nominal target. Noise frames would drag the level estimate down and
      * over-drive the speech. */
-    /* ESP32 port: the smoothing factor is adjustable (mbe_ambe2400_enc_agc_alpha); 1.0 freezes the AGC at
-     * unity gain. Upstream tracks every non-silence frame with 0.9, so on noisy input the background noise
-     * between words moves the gain and the level pumps at speech onsets. */
-    float alpha = mbe_ambe2400_enc_agc_alpha;
-    if (alpha >= 1.0f) {
-        enc->agc_rms = AMBE2400_ENC_AGC_TARGET;
-    } else if (!is_silence && rms > 1e-6f) {
-        enc->agc_rms = (alpha * enc->agc_rms) + ((1.0f - alpha) * rms);
+    if (!is_silence && rms > 1e-6f) {
+        enc->agc_rms = (AMBE2400_ENC_AGC_ALPHA * enc->agc_rms) + ((1.0f - AMBE2400_ENC_AGC_ALPHA) * rms);
     }
     enc->agc_gain = AMBE2400_ENC_AGC_TARGET / (enc->agc_rms + 1e-9f);
     if (enc->agc_gain < AMBE2400_ENC_AGC_MIN) {
@@ -1082,17 +863,8 @@ mbe_encodeAmbe2400Parms(mbe_ambe2400_encoder* enc, const float* samples, char am
 
     ambe2400_enc_apply_agc(enc, samples, rms, is_silence, agc_buf);
 
-    /* ESP32 port: optional separate pitch source for this frame (see ambe2400_enc_pitch). */
-    enc->have_pnow = (mbe_ambe2400_enc_pitch_pcm != NULL);
-    if (enc->have_pnow) {
-        for (int i = 0; i < AMBE2400_ENC_SAMPLES; i++) {
-            enc->pnow[i] = (float)mbe_ambe2400_enc_pitch_pcm[i] / 32768.0f;
-        }
-    }
-
     if (is_silence) {
         ambe2400_encode_silence(ambe_d, cur_mp);
-        enc->env_valid = 0;
     } else {
         int ret = ambe2400_encode_voice(enc, agc_buf, ambe_d, cur_mp, prev_mp);
         if (ret < 0) {
@@ -1102,9 +874,6 @@ mbe_encodeAmbe2400Parms(mbe_ambe2400_encoder* enc, const float* samples, char am
 
     memcpy(enc->history, agc_buf, (size_t)AMBE2400_ENC_SAMPLES * sizeof(float));
     enc->hist_gain = enc->agc_gain;
-    if (enc->have_pnow) {
-        memcpy(enc->phist, enc->pnow, sizeof(enc->phist));
-    }
 
     return (int)is_silence;
 }
