@@ -1,32 +1,35 @@
-# ESP32 AMBE3000 (DV3000) compatible server over Wi-Fi
+# ESP32 AMBE3000 (DV3000) compatible vocoder for D-STAR
 
-ESP32 firmware that answers the DV3000 / AMBE-3000R serial protocol (`0x61 | len | type | payload`) over
-**UDP and TCP port 2460** (BlueDV "AMBE server" compatible), with a serial setup console for Wi-Fi settings.
-D-STAR (AMBE 3600x2400, 2400 bps voice + 1200 bps FEC) only. Codec: mbelib-neo (vendored, modified).
+ESP32 firmware that behaves like a DVSI **DV3000 / AMBE-3000R** for **D-STAR** (AMBE 3600x2400), using the open-source
+codec **mbelib-neo**. PC software such as **BlueDV** uses it over **Wi-Fi** (UDP/TCP 2460, "AMBE server") or **USB**
+(serial, 460800 bps).
 
-Full documentation (Japanese): [README_WIFI.md](README_WIFI.md)
+**Status:** transmit and receive work end to end. Receive audio is good; **transmit audio (the mbelib-neo encoder) is
+still clearly worse than a real DV3000** — pitch octave errors, onset chirps, voicing. Help is very welcome:
+see [docs/AUDIO_FINDINGS.md](docs/AUDIO_FINDINGS.md) (section 3, *Help wanted*).
 
-## Build (ESP-IDF 5.1.6, Windows)
-```
-.\idf_env.bat build
-.\idf_env.bat -p COM12 flash
-```
-Edit the ESP-IDF and Python environment paths in `idf_env.bat` for your PC.
+ESP32 を DVSI 社の AMBE チップ（DV3000）の代わりにする、D-STAR 用のファームウェアです。BlueDV から Wi-Fi または USB で
+使えます。送受信はできますが、**送信の音質（mbelib-neo の符号化器）が本物の DV3000 に及ばず、改良に協力してくれる方を
+探しています。**
 
-ESP32-S3 (separate build directory; setup console on the built-in USB Serial/JTAG port):
-```
-.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.wifi" set-target esp32s3
-.\idf_env.bat -B build_s3 -D SDKCONFIG=sdkconfig.s3 -p COM5 flash
-```
+## Branches / 開発系統
+| Branch | Board | Link to the PC | Audio processing |
+|---|---|---|---|
+| [`esp32`](../../tree/esp32) | ESP32 DevKit | Wi-Fi (UDP/TCP 2460) | mbelib-neo with a modified encoder + pre-processing (HPF, gate, noise reduction, auto EQ) |
+| [`s3`](../../tree/s3) | ESP32-S3 (single built-in USB) | Wi-Fi, or USB (GPIO 4 to GND at boot) | same as `esp32` |
+| [`usb-esp32`](../../tree/usb-esp32) | ESP32 DevKit | USB only (USB-UART, 460800 bps) | **unmodified mbelib-neo** + noise gate + onset pitch priming (reference line) |
 
-## License
-* Firmware in `main/`, `tools/`: GPL-2.0-or-later (see [LICENSE](LICENSE)).
-* `components/mbelib_neo/vendor/mbelib-neo`: mbelib-neo, GPL-2.0-or-later (see its LICENSE / LICENSES).
-  The encoder (`src/ambe/ambe3600x2400_enc.c`) and `src/internal/mbe_compiler.h` contain local
-  modifications for this project (documented in README_WIFI.md).
-* Any firmware binary built from this repository is distributed under the GPL.
+`main` is this landing page only; the firmware is in the branches above. Each version that was flashed and tested is
+tagged `<line>-YYYY.MM.DD` and described in that branch's `CHANGELOG.md`.
 
-## Patent notice
-The AMBE vocoder is covered by patents held by Digital Voice Systems, Inc. (DVSI) in some jurisdictions.
-This software implementation is provided for experimentation; check the legal situation where you live
-before using or distributing it.
+## Documents / 資料
+* [docs/OVERVIEW.md](docs/OVERVIEW.md) — what it is, the three lines, build and flash
+* [docs/PROTOCOL.md](docs/PROTOCOL.md) — DV3000 packets implemented, private tuning commands
+* [docs/AUDIO_FINDINGS.md](docs/AUDIO_FINDINGS.md) — measurements, causes found, what failed, **open problems**
+* [docs/TESTING.md](docs/TESTING.md) — how we test (Peanut A/B by ear, captures, `tools/audio_test/` scoring)
+* [docs/BlueDV_D-STAR_hosts_fix.pdf](docs/BlueDV_D-STAR_hosts_fix.pdf) — BlueDV D-STAR host list workaround
+
+## License / Patent notice
+* Firmware and tools: GPL-2.0-or-later ([LICENSE](LICENSE)). mbelib-neo: GPL-2.0-or-later.
+* The AMBE vocoder is covered by DVSI patents in some jurisdictions. This is provided for experimentation; check the
+  legal situation where you live before using or distributing it.
