@@ -26,3 +26,8 @@ main/.git_unused/
 build_s3/
 sdkconfig.s3
 
+
+# Editor settings (contain local paths)
+.vscode/
+*.code-workspace
+__pycache__/
