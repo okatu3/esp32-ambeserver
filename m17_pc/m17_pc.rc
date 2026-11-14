@@ -1,0 +1,3 @@
+// m17_pc.exe: icon (make_icon.ps1) and the manifest for common controls v6.
+1 ICON "m17_pc.ico"
+1 24 "m17_pc.manifest"

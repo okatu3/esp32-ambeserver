@@ -1,0 +1,987 @@
+/* m17_pc: a window for the M17 station of m17_engine.c.
+ * Left: reflector (hosts\M17Hosts.txt, filtered as you type), host and port, module, callsign, destination,
+ * microphone, connect, the PTT (F2 toggles it like the button), meters. Right: the call being heard, last heard
+ * and the log. Settings are kept in m17_pc.ini next to the program. */
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
+#include <commctrl.h>
+#include <shellapi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+
+#include "license_check.h"
+#include "m17_engine.h"
+#include "m17_parrot.h"
+#include "mic_win.h"
+
+enum {
+    ID_FILTER = 100, ID_REFL, ID_HOST, ID_PORT, ID_MODULE, ID_CALL, ID_DEST, ID_MIC, ID_SAVE, ID_CONNECT, ID_PTT,
+    ID_STATUS, ID_RXINFO, ID_MICBAR, ID_RXBAR, ID_HEARD, ID_LOG, ID_PARROT, ID_ADD, ID_DEL, ID_TIMER = 1, WM_LOGLINE = WM_APP + 1
+};
+
+static HWND s_wnd, s_ctl[64];
+static HFONT s_font, s_big;
+static int s_dpi = 96;
+static wchar_t s_ini[MAX_PATH], s_dir[MAX_PATH];
+static bool s_connected, s_warned;
+static int s_heard_shown = -1;
+static char s_heard_top[40];
+
+static int S(int v)
+{
+    return MulDiv(v, s_dpi, 96);
+}
+
+static HWND ctl(int id)
+{
+    return s_ctl[id - 100];
+}
+
+static HWND add(const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id)
+{
+    HWND c = CreateWindowExW(!wcscmp(cls, L"EDIT") || !wcscmp(cls, WC_LISTVIEWW) ? WS_EX_CLIENTEDGE : 0, cls, text,
+                             WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(w), S(h), s_wnd,
+                             (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
+    SendMessageW(c, WM_SETFONT, (WPARAM)s_font, TRUE);
+    if (id >= 100 && id < 164) {
+        s_ctl[id - 100] = c;
+    }
+    return c;
+}
+
+static void label(const wchar_t *t, int x, int y, int w)
+{
+    add(L"STATIC", t, SS_LEFT, x, y + 3, w, 20, 0);
+}
+
+/* ---------------------------------------------------------------- reflector list
+ * hosts\M17Hosts.txt (UTF-8): one reflector per line, "NAME HOST [PORT]  # comment"; the comment is shown in the
+ * list. The add / delete buttons write the file (add: appended at the end; delete: that line removed). */
+typedef struct {
+    char name[64], host[128], desc[128];
+    unsigned port;
+} refl_t;
+static refl_t *s_refl;
+static int s_refl_n, s_refl_cap;
+static int s_shown[4000];                   /* combo row -> s_refl index */
+static int s_shown_n;
+
+static int refl_cmp(const void *a, const void *b)
+{
+    return _stricmp(((const refl_t *)a)->name, ((const refl_t *)b)->name);
+}
+
+static void hosts_path(wchar_t *path)
+{
+    swprintf(path, MAX_PATH, L"%ls\\hosts\\M17Hosts.txt", s_dir);
+}
+
+/* splits "NAME HOST [PORT] # comment"; false for blank and comment-only lines */
+static bool parse_host_line(const char *line, refl_t *r)
+{
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", line);
+    buf[strcspn(buf, "\r\n")] = 0;
+    char *hash = strchr(buf, '#');
+    r->desc[0] = 0;
+    if (hash) {
+        *hash = 0;
+        const char *d = hash + 1;
+        while (*d == ' ' || *d == '\t') {
+            ++d;
+        }
+        snprintf(r->desc, sizeof(r->desc), "%s", d);
+    }
+    unsigned port = 0;
+    if (sscanf(buf, "%63s %127s %u", r->name, r->host, &port) < 2) {
+        return false;
+    }
+    r->port = port ? port : M17_PORT;
+    return true;
+}
+
+static void load_reflectors(void)
+{
+    s_refl_n = 0;
+    wchar_t path[MAX_PATH];
+    hosts_path(path);
+    FILE *f = _wfopen(path, L"r");
+    if (!f) {
+        return;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        refl_t r;
+        if (!parse_host_line(line, &r)) {
+            continue;
+        }
+        if (s_refl_n == s_refl_cap) {
+            s_refl_cap = s_refl_cap ? s_refl_cap * 2 : 256;
+            s_refl = realloc(s_refl, (size_t)s_refl_cap * sizeof(refl_t));
+        }
+        s_refl[s_refl_n++] = r;
+    }
+    fclose(f);
+    qsort(s_refl, (size_t)s_refl_n, sizeof(refl_t), refl_cmp);
+}
+
+static bool contains_ci(const char *hay, const char *needle)
+{
+    size_t n = strlen(needle);
+    if (!n) {
+        return true;
+    }
+    for (; *hay; ++hay) {
+        if (!_strnicmp(hay, needle, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void fill_reflectors(void)
+{
+    wchar_t wf[64];
+    char flt[192];
+    GetWindowTextW(ctl(ID_FILTER), wf, 64);
+    WideCharToMultiByte(CP_UTF8, 0, wf, -1, flt, sizeof(flt), NULL, NULL);
+    HWND cb = ctl(ID_REFL);
+    SendMessageW(cb, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    s_shown_n = 0;
+    for (int i = 0; i < s_refl_n && s_shown_n < (int)(sizeof(s_shown) / sizeof(s_shown[0])); ++i) {
+        const refl_t *r = &s_refl[i];
+        if (!contains_ci(r->name, flt) && !contains_ci(r->host, flt) && !contains_ci(r->desc, flt)) {
+            continue;
+        }
+        char a[400];
+        wchar_t w[400];
+        snprintf(a, sizeof(a), "%s  %s  (%s:%u)", r->name, r->desc, r->host, r->port);
+        MultiByteToWideChar(CP_UTF8, 0, a, -1, w, 400);
+        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)w);
+        s_shown[s_shown_n++] = i;
+    }
+    SendMessageW(cb, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(cb, NULL, TRUE);
+}
+
+static void pick_reflector(void)
+{
+    int row = (int)SendMessageW(ctl(ID_REFL), CB_GETCURSEL, 0, 0);
+    if (row < 0 || row >= s_shown_n) {
+        return;
+    }
+    const refl_t *r = &s_refl[s_shown[row]];
+    SetWindowTextA(ctl(ID_HOST), r->host);
+    char port[12];
+    snprintf(port, sizeof(port), "%u", r->port);
+    SetWindowTextA(ctl(ID_PORT), port);
+}
+
+static void select_reflector(const char *name)    /* show the list unfiltered and select NAME */
+{
+    SetWindowTextW(ctl(ID_FILTER), L"");
+    fill_reflectors();
+    for (int i = 0; i < s_shown_n; ++i) {
+        if (!_stricmp(s_refl[s_shown[i]].name, name)) {
+            SendMessageW(ctl(ID_REFL), CB_SETCURSEL, (WPARAM)i, 0);
+            return;
+        }
+    }
+}
+
+/* rewrites hosts\M17Hosts.txt without the lines whose NAME is `name` (comments and order kept); appends `add` */
+static bool rewrite_hosts(const char *name, const char *add)
+{
+    wchar_t path[MAX_PATH], tmp[MAX_PATH];
+    hosts_path(path);
+    swprintf(tmp, MAX_PATH, L"%ls.new", path);
+    wchar_t dir[MAX_PATH];
+    swprintf(dir, MAX_PATH, L"%ls\\hosts", s_dir);
+    CreateDirectoryW(dir, NULL);
+    FILE *in = _wfopen(path, L"rb");
+    FILE *out = _wfopen(tmp, L"wb");
+    if (!out) {
+        if (in) {
+            fclose(in);
+        }
+        return false;
+    }
+    char line[512];
+    bool ends_nl = true;
+    while (in && fgets(line, sizeof(line), in)) {
+        refl_t r;
+        if (name && parse_host_line(line, &r) && !_stricmp(r.name, name)) {
+            continue;
+        }
+        fputs(line, out);
+        size_t n = strlen(line);
+        ends_nl = n && line[n - 1] == '\n';
+    }
+    if (in) {
+        fclose(in);
+    }
+    if (add) {
+        if (!ends_nl) {
+            fputs("\n", out);
+        }
+        fputs(add, out);
+        fputs("\n", out);
+    }
+    bool ok = fclose(out) == 0;
+    return ok && MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING);
+}
+
+/* ---------------------------------------------------------------- settings */
+static void ini_get(const wchar_t *key, const wchar_t *def, int id)
+{
+    wchar_t v[256];
+    GetPrivateProfileStringW(L"m17_pc", key, def, v, 256, s_ini);
+    SetWindowTextW(ctl(id), v);
+}
+
+static void ini_put(const wchar_t *key, int id)
+{
+    wchar_t v[256];
+    GetWindowTextW(ctl(id), v, 256);
+    WritePrivateProfileStringW(L"m17_pc", key, v, s_ini);
+}
+
+static void load_settings(void)
+{
+    ini_get(L"host", L"", ID_HOST);
+    ini_get(L"port", L"17000", ID_PORT);
+    ini_get(L"callsign", L"", ID_CALL);
+    ini_get(L"dest", L"@ALL", ID_DEST);
+    ini_get(L"filter", L"", ID_FILTER);
+    int mod = GetPrivateProfileIntW(L"m17_pc", L"module", 0, s_ini);
+    SendMessageW(ctl(ID_MODULE), CB_SETCURSEL, (WPARAM)(mod >= 0 && mod < 26 ? mod : 0), 0);
+    int mic = GetPrivateProfileIntW(L"m17_pc", L"mic", -1, s_ini);
+    SendMessageW(ctl(ID_MIC), CB_SETCURSEL, (WPARAM)(mic + 1), 0);
+    SendMessageW(ctl(ID_SAVE), BM_SETCHECK, GetPrivateProfileIntW(L"m17_pc", L"save_rx", 0, s_ini) ? BST_CHECKED : 0, 0);
+}
+
+static void save_settings(void)
+{
+    ini_put(L"host", ID_HOST);
+    ini_put(L"port", ID_PORT);
+    ini_put(L"callsign", ID_CALL);
+    ini_put(L"dest", ID_DEST);
+    ini_put(L"filter", ID_FILTER);
+    wchar_t v[16];
+    swprintf(v, 16, L"%d", (int)SendMessageW(ctl(ID_MODULE), CB_GETCURSEL, 0, 0));
+    WritePrivateProfileStringW(L"m17_pc", L"module", v, s_ini);
+    swprintf(v, 16, L"%d", (int)SendMessageW(ctl(ID_MIC), CB_GETCURSEL, 0, 0) - 1);
+    WritePrivateProfileStringW(L"m17_pc", L"mic", v, s_ini);
+    WritePrivateProfileStringW(L"m17_pc", L"save_rx",
+                               SendMessageW(ctl(ID_SAVE), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0", s_ini);
+}
+
+static void get_a(int id, char *out, int size)
+{
+    wchar_t w[256];
+    GetWindowTextW(ctl(id), w, 256);
+    WideCharToMultiByte(CP_ACP, 0, w, -1, out, size, NULL, NULL);
+    char *s = out;                               /* trim */
+    while (*s == ' ') {
+        ++s;
+    }
+    memmove(out, s, strlen(s) + 1);
+    size_t n = strlen(out);
+    while (n && out[n - 1] == ' ') {
+        out[--n] = 0;
+    }
+}
+
+/* ---------------------------------------------------------------- log */
+static void append_log(const char *line)
+{
+    HWND e = ctl(ID_LOG);
+    wchar_t w[600];
+    int n = MultiByteToWideChar(CP_ACP, 0, line, -1, w, 590);
+    if (n <= 0) {
+        return;
+    }
+    wcscat(w, L"\r\n");
+    int len = GetWindowTextLengthW(e);
+    if (len > 60000) {
+        SendMessageW(e, EM_SETSEL, 0, 20000);
+        SendMessageW(e, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        len = GetWindowTextLengthW(e);
+    }
+    SendMessageW(e, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageW(e, EM_REPLACESEL, FALSE, (LPARAM)w);
+}
+
+static void append_logw(const wchar_t *text)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t w[700];
+    swprintf(w, 700, L"%02u:%02u:%02u  %ls\r\n", st.wHour % 24u, st.wMinute % 60u, st.wSecond % 60u, text);
+    HWND e = ctl(ID_LOG);
+    int len = GetWindowTextLengthW(e);
+    SendMessageW(e, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageW(e, EM_REPLACESEL, FALSE, (LPARAM)w);
+}
+
+/* ---------------------------------------------------------------- licence check (once per callsign per run)
+ * Opens the public search of 総務省 電波利用ポータル for the callsign in the user's own browser; the user sees
+ * whether the station is listed. m17_pc keeps working either way. Off with license_check=0 in m17_pc.ini. */
+static char s_checked[16][16];
+static int s_checked_n;
+
+static void license_check_open(const char *call)
+{
+    if (!GetPrivateProfileIntW(L"m17_pc", L"license_check", 1, s_ini)) {
+        return;
+    }
+    char base[16];
+    license_base_call(call, base);
+    for (int i = 0; i < s_checked_n; ++i) {
+        if (!strcmp(s_checked[i], base)) {
+            return;                                  /* already shown during this run */
+        }
+    }
+    if (s_checked_n < 16) {
+        snprintf(s_checked[s_checked_n++], 16, "%s", base);
+    }
+    wchar_t w[600];
+    if (!license_is_japanese(base)) {
+        swprintf(w, 600, L"免許の照合: %hs は日本のアマチュア局の形式ではないので照合しません", base);
+        append_logw(w);
+        return;
+    }
+    char url[400];
+    license_search_url(base, url, sizeof(url));
+    if ((INT_PTR)ShellExecuteA(s_wnd, "open", url, NULL, NULL, SW_SHOWNORMAL) <= 32) {
+        append_logw(L"免許の照合: ブラウザを開けませんでした。このまま使えます");
+        return;
+    }
+    swprintf(w, 600, L"免許の照合: 総務省 電波利用ポータルの無線局等情報検索で %hs をブラウザに表示しました", base);
+    append_logw(w);
+    swprintf(w, 600,
+             L"総務省 電波利用ポータルの「無線局等情報検索」で、%hs の検索結果をブラウザに表示しました。\n\n"
+             L"一覧に「（%hs）」がない場合、無線局の免許を受けずに送信すると、電波法により罰せられる可能性があります。\n\n"
+             L"このまま使い続けることはできます。",
+             base, base);
+    MessageBoxW(s_wnd, w, L"m17_pc  免許の照合", MB_OK | MB_ICONINFORMATION);
+}
+
+static void engine_log(const char *line)          /* engine thread -> window thread */
+{
+    char *copy = _strdup(line);
+    if (!copy || !PostMessageW(s_wnd, WM_LOGLINE, 0, (LPARAM)copy)) {
+        free(copy);
+    }
+}
+
+/* ---------------------------------------------------------------- a one-line text prompt (modal) */
+static struct {
+    HWND wnd, edit;
+    bool done, ok;
+    wchar_t *io;
+    int size;
+} P;
+
+static LRESULT CALLBACK prompt_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            P.ok = LOWORD(wp) == IDOK;
+            if (P.ok) {
+                GetWindowTextW(P.edit, P.io, P.size);
+            }
+            P.done = true;
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        P.done = true;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static bool prompt(const wchar_t *title, const wchar_t *text, wchar_t *io, int size)
+{
+    static bool registered;
+    if (!registered) {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = prompt_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"m17_pc_prompt";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    RECT pr, r = { 0, 0, S(420), S(124) };
+    GetWindowRect(s_wnd, &pr);
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&r, style, FALSE);
+    int w = r.right - r.left, hgt = r.bottom - r.top;
+    P.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"m17_pc_prompt", title, style, pr.left + ((pr.right - pr.left) - w) / 2,
+                            pr.top + S(120), w, hgt, s_wnd, NULL, GetModuleHandleW(NULL), NULL);
+    HWND lb = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT, S(12), S(10), S(396), S(40), P.wnd,
+                              NULL, NULL, NULL);
+    P.edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", io, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                             S(12), S(52), S(396), S(24), P.wnd, NULL, NULL, NULL);
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              S(232), S(86), S(84), S(28), P.wnd, (HMENU)IDOK, NULL, NULL);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"やめる", WS_CHILD | WS_VISIBLE | WS_TABSTOP, S(324), S(86), S(84),
+                                  S(28), P.wnd, (HMENU)IDCANCEL, NULL, NULL);
+    HWND all[4] = { lb, P.edit, ok, cancel };
+    for (int i = 0; i < 4; ++i) {
+        SendMessageW(all[i], WM_SETFONT, (WPARAM)s_font, TRUE);
+    }
+    P.io = io;
+    P.size = size;
+    P.done = P.ok = false;
+    EnableWindow(s_wnd, FALSE);
+    ShowWindow(P.wnd, SW_SHOW);
+    SetFocus(P.edit);
+    SendMessageW(P.edit, EM_SETSEL, 0, -1);
+    MSG m;
+    while (!P.done && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(P.wnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    EnableWindow(s_wnd, TRUE);
+    DestroyWindow(P.wnd);
+    SetForegroundWindow(s_wnd);
+    return P.ok;
+}
+
+/* ---------------------------------------------------------------- add to / delete from the reflector list */
+static void add_reflector(void)
+{
+    char host[128], port_s[16];
+    get_a(ID_HOST, host, sizeof(host));
+    get_a(ID_PORT, port_s, sizeof(port_s));
+    unsigned port = (unsigned)atoi(port_s);
+    if (!host[0] || strchr(host, ' ') || strchr(host, '#')) {
+        MessageBoxW(s_wnd, L"先に「ホスト」と「ポート」に、追加したいリフレクターを入れてください。", L"m17_pc  一覧に追加",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    if (!port) {
+        port = M17_PORT;
+    }
+    wchar_t name[64] = L"";
+    me_status_t st;
+    me_get_status(&st);
+    if (s_connected && st.reflector[0]) {
+        MultiByteToWideChar(CP_ACP, 0, st.reflector, -1, name, 64);     /* the name the reflector gives in PING */
+    } else {
+        for (int i = 0; i < s_refl_n; ++i) {
+            if (!_stricmp(s_refl[i].host, host) && s_refl[i].port == port) {
+                MultiByteToWideChar(CP_UTF8, 0, s_refl[i].name, -1, name, 64);
+                break;
+            }
+        }
+    }
+    wchar_t text[300];
+    swprintf(text, 300, L"%hs:%u を一覧に追加します。名前を入れてください（例 M17-XXX、空白なし）。", host, port);
+    if (!prompt(L"m17_pc  一覧に追加", text, name, 64)) {
+        return;
+    }
+    char n8[64];
+    int k = 0;
+    for (const wchar_t *c = name; *c && k < 32; ++c) {               /* letters, digits and - _ / . only */
+        wchar_t ch = *c >= L'a' && *c <= L'z' ? (wchar_t)(*c - 32) : *c;
+        if ((ch >= L'A' && ch <= L'Z') || (ch >= L'0' && ch <= L'9') || ch == L'-' || ch == L'_' || ch == L'/' || ch == L'.') {
+            n8[k++] = (char)ch;
+        } else if (ch == L' ' && k) {
+            n8[k++] = '-';
+        }
+    }
+    n8[k] = 0;
+    if (!k) {
+        MessageBoxW(s_wnd, L"名前には英字・数字・ - _ / . を使ってください。", L"m17_pc  一覧に追加", MB_ICONINFORMATION);
+        return;
+    }
+    wchar_t desc[128] = L"";
+    if (!prompt(L"m17_pc  一覧に追加", L"説明（なくてもよい。一覧の名前の横に出ます）", desc, 128)) {
+        return;
+    }
+    for (wchar_t *c = desc; *c; ++c) {
+        if (*c == L'#' || *c == L'\r' || *c == L'\n') {
+            *c = L' ';
+        }
+    }
+    bool exists = false;
+    for (int i = 0; i < s_refl_n; ++i) {
+        exists |= !_stricmp(s_refl[i].name, n8);
+    }
+    if (exists) {
+        wchar_t q[200];
+        swprintf(q, 200, L"%hs はもう一覧にあります。新しいホストとポートで置き換えますか？", n8);
+        if (MessageBoxW(s_wnd, q, L"m17_pc  一覧に追加", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) {
+            return;
+        }
+    }
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char d8[400], line[700];
+    WideCharToMultiByte(CP_UTF8, 0, desc, -1, d8, sizeof(d8), NULL, NULL);
+    snprintf(line, sizeof(line), "%-8s %-28s %-5u  # %s%s(追加 %04u-%02u-%02u)", n8, host, port, d8, d8[0] ? " " : "",
+             t.wYear, t.wMonth, t.wDay);
+    if (!rewrite_hosts(exists ? n8 : NULL, line)) {
+        MessageBoxW(s_wnd, L"hosts\\M17Hosts.txt に書き込めませんでした。", L"m17_pc  一覧に追加", MB_ICONWARNING);
+        return;
+    }
+    load_reflectors();
+    select_reflector(n8);
+    wchar_t w[300];
+    swprintf(w, 300, L"一覧に追加しました: %hs  %hs:%u", n8, host, port);
+    append_logw(w);
+}
+
+static void delete_reflector(void)
+{
+    int row = (int)SendMessageW(ctl(ID_REFL), CB_GETCURSEL, 0, 0);
+    if (row < 0 || row >= s_shown_n) {
+        MessageBoxW(s_wnd, L"消したいリフレクターを「リフレクター」の一覧で選んでください。", L"m17_pc  一覧から削除",
+                    MB_ICONINFORMATION);
+        return;
+    }
+    refl_t r = s_refl[s_shown[row]];
+    wchar_t q[300];
+    swprintf(q, 300, L"%hs（%hs:%u）を一覧から消しますか？\n（hosts\\M17Hosts.txt から、その行がなくなります）", r.name,
+             r.host, r.port);
+    if (MessageBoxW(s_wnd, q, L"m17_pc  一覧から削除", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) {
+        return;
+    }
+    if (!rewrite_hosts(r.name, NULL)) {
+        MessageBoxW(s_wnd, L"hosts\\M17Hosts.txt に書き込めませんでした。", L"m17_pc  一覧から削除", MB_ICONWARNING);
+        return;
+    }
+    load_reflectors();
+    fill_reflectors();
+    wchar_t w[200];
+    swprintf(w, 200, L"一覧から削除しました: %hs", r.name);
+    append_logw(w);
+}
+
+/* ---------------------------------------------------------------- connect / PTT */
+static void set_enabled_fields(bool on)
+{
+    static const int ids[] = { ID_FILTER, ID_REFL, ID_HOST, ID_PORT, ID_MODULE, ID_CALL, ID_DEST, ID_MIC, ID_SAVE, ID_DEL };
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); ++i) {
+        EnableWindow(ctl(ids[i]), on);
+    }
+}
+
+static void do_connect(void)
+{
+    if (s_connected) {
+        me_stop();
+        s_connected = false;
+        SetWindowTextW(ctl(ID_CONNECT), L"接続");
+        set_enabled_fields(true);
+        return;
+    }
+    me_cfg_t c;
+    me_default_cfg(&c);
+    get_a(ID_HOST, c.host, sizeof(c.host));
+    char tmp[32];
+    get_a(ID_PORT, tmp, sizeof(tmp));
+    c.port = (uint16_t)(atoi(tmp) ? atoi(tmp) : M17_PORT);
+    c.module = (char)('A' + (int)SendMessageW(ctl(ID_MODULE), CB_GETCURSEL, 0, 0));
+    get_a(ID_CALL, c.callsign, sizeof(c.callsign));
+    CharUpperA(c.callsign);
+    get_a(ID_DEST, c.dest, sizeof(c.dest));
+    CharUpperA(c.dest);
+    c.mic_device = (int)SendMessageW(ctl(ID_MIC), CB_GETCURSEL, 0, 0) - 1;
+    c.tx_gain_db = (float)GetPrivateProfileIntW(L"m17_pc", L"tx_gain_db", 0, s_ini);   /* gains: only in the ini */
+    c.rx_gain_db = (float)GetPrivateProfileIntW(L"m17_pc", L"rx_gain_db", 0, s_ini);
+    if (SendMessageW(ctl(ID_SAVE), BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        wchar_t d[MAX_PATH];
+        swprintf(d, MAX_PATH, L"%ls\\recordings", s_dir);
+        CreateDirectoryW(d, NULL);
+        WideCharToMultiByte(CP_ACP, 0, d, -1, c.wav_dir, sizeof(c.wav_dir), NULL, NULL);
+    }
+    if (!c.host[0] || !c.callsign[0]) {
+        MessageBoxW(s_wnd, L"リフレクター（ホスト）とコールサインを入れてください。", L"m17_pc", MB_ICONINFORMATION);
+        return;
+    }
+    save_settings();
+    if (!me_start(&c, engine_log)) {
+        append_log("[E] cannot start (codec or audio)");
+        return;
+    }
+    s_connected = true;
+    SetWindowTextW(ctl(ID_CONNECT), L"切断");
+    set_enabled_fields(false);
+    license_check_open(c.callsign);
+}
+
+static unsigned parrot_port(void)
+{
+    unsigned p = (unsigned)GetPrivateProfileIntW(L"m17_pc", L"parrot_port", PARROT_PORT, s_ini);
+    return p ? p : PARROT_PORT;
+}
+
+/* The built-in test reflector: start it and point host/port at it, or stop it. */
+static void toggle_parrot(void)
+{
+    if (parrot_running()) {
+        parrot_stop();
+        SetWindowTextW(ctl(ID_PARROT), L"パロットで試す");
+        return;
+    }
+    if (!parrot_start((uint16_t)parrot_port(), engine_log)) {
+        MessageBoxW(s_wnd, L"試験用リフレクターを起動できませんでした（ポートが使われています）。\n"
+                           L"m17_pc.ini の parrot_port で別の番号にできます。", L"m17_pc", MB_ICONWARNING);
+        return;
+    }
+    SetWindowTextW(ctl(ID_PARROT), L"パロットを止める");
+    if (!s_connected) {
+        SetWindowTextW(ctl(ID_HOST), L"127.0.0.1");
+        wchar_t p[12];
+        swprintf(p, 12, L"%u", parrot_port());
+        SetWindowTextW(ctl(ID_PORT), p);
+        append_log("host and port now point at the parrot: connect, then talk with F2 (you hear yourself 1 s later)");
+    }
+}
+
+static bool to_parrot(void)                       /* connected to our own test reflector? */
+{
+    char host[64], port[16];
+    get_a(ID_HOST, host, sizeof(host));
+    get_a(ID_PORT, port, sizeof(port));
+    return parrot_running() && (!strcmp(host, "127.0.0.1") || !_stricmp(host, "localhost")) &&
+           (unsigned)atoi(port) == parrot_port();
+}
+
+static void toggle_ptt(void)
+{
+    me_status_t st;
+    me_get_status(&st);
+    if (!s_connected || st.link != ML_UP) {
+        return;
+    }
+    if (!st.tx && !s_warned && !to_parrot()) {
+        int a = MessageBoxW(s_wnd,
+                            L"送信した声は、リフレクターにつながっている世界中の局に届きます。\n"
+                            L"アマチュア無線の免許を持つ本人が、そのコールサインで送信してください。\n\n"
+                            L"送信しますか？（この確認は、このアプリを閉じるまで一度だけ出ます）",
+                            L"m17_pc  送信の確認", MB_OKCANCEL | MB_ICONWARNING);
+        if (a != IDOK) {
+            return;
+        }
+        s_warned = true;
+    }
+    me_set_ptt(!st.tx);
+}
+
+/* ---------------------------------------------------------------- status */
+static int bar_pos(float dbfs)                   /* -60..0 dBFS -> 0..60 */
+{
+    int v = (int)(dbfs + 60.0f);
+    return v < 0 ? 0 : (v > 60 ? 60 : v);
+}
+
+static void set_text_if(HWND c, const wchar_t *t)
+{
+    wchar_t cur[300];
+    GetWindowTextW(c, cur, 300);
+    if (wcscmp(cur, t)) {
+        SetWindowTextW(c, t);
+    }
+}
+
+static void update_status(void)
+{
+    me_status_t st;
+    me_get_status(&st);
+    if (s_connected && !me_running()) {          /* the engine stopped by itself (socket, codec) */
+        s_connected = false;
+        SetWindowTextW(ctl(ID_CONNECT), L"接続");
+        set_enabled_fields(true);
+    }
+    wchar_t t[300];
+    if (!s_connected) {
+        wcscpy(t, L"未接続");
+    } else if (st.tx) {
+        swprintf(t, 300, L"送信中  %.1f 秒", st.tx_seconds);
+    } else if (st.link == ML_UP) {
+        if (st.rx) {
+            wcscpy(t, L"受信中");
+        } else if (st.reflector[0]) {
+            swprintf(t, 300, L"接続中  %hs", st.reflector);
+        } else {
+            wcscpy(t, L"接続中（待受）");
+        }
+    } else if (st.link == ML_REFUSED) {
+        wcscpy(t, L"接続を断られました");
+    } else {
+        wcscpy(t, L"接続しています…");
+    }
+    set_text_if(ctl(ID_STATUS), t);
+    if (st.rx) {
+        swprintf(t, 300, L"%hs  →  %hs   Codec 2 %hs   欠落 %u %%", st.rx_call, st.rx_dest, st.rx_type, st.rx_lost_pct);
+    } else {
+        t[0] = 0;
+    }
+    set_text_if(ctl(ID_RXINFO), t);
+    set_text_if(ctl(ID_PTT), st.tx ? L"送信をやめる (F2)" : L"送信 PTT (F2)");
+    EnableWindow(ctl(ID_PTT), s_connected && st.link == ML_UP);
+    SendMessageW(ctl(ID_MICBAR), PBM_SETPOS, (WPARAM)(st.tx ? bar_pos(st.mic_dbfs) : 0), 0);
+    SendMessageW(ctl(ID_RXBAR), PBM_SETPOS, (WPARAM)(st.rx ? bar_pos(st.rx_dbfs) : 0), 0);
+
+    char top[40] = "";
+    if (st.heard_n) {
+        snprintf(top, sizeof(top), "%s%s", st.heard[0].time, st.heard[0].call);
+    }
+    if (st.heard_n != s_heard_shown || strcmp(top, s_heard_top)) {
+        HWND lv = ctl(ID_HEARD);
+        ListView_DeleteAllItems(lv);
+        for (int i = 0; i < st.heard_n; ++i) {
+            const me_heard_t *h = &st.heard[i];
+            wchar_t c0[16], c1[16], c2[16], c3[8], c4[16];
+            swprintf(c0, 16, L"%hs", h->time);
+            swprintf(c1, 16, L"%hs", h->call);
+            swprintf(c2, 16, L"%hs", h->dest);
+            swprintf(c3, 8, L"%hs", h->type);
+            swprintf(c4, 16, L"%.1f 秒", h->seconds);
+            LVITEMW it = { 0 };
+            it.mask = LVIF_TEXT;
+            it.iItem = i;
+            it.pszText = c0;
+            ListView_InsertItem(lv, &it);
+            ListView_SetItemText(lv, i, 1, c1);
+            ListView_SetItemText(lv, i, 2, c2);
+            ListView_SetItemText(lv, i, 3, c3);
+            ListView_SetItemText(lv, i, 4, c4);
+        }
+        s_heard_shown = st.heard_n;
+        snprintf(s_heard_top, sizeof(s_heard_top), "%s", top);
+    }
+}
+
+/* ---------------------------------------------------------------- window */
+static void create_controls(void)
+{
+    int x = 12, y = 12;
+    label(L"一覧の絞り込み", x, y, 110);
+    add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, x + 116, y, 140, 24, ID_FILTER);
+    add(L"STATIC", L"（名前・ホストの一部）", SS_LEFT, x + 264, y + 3, 200, 20, 0);
+    y += 32;
+    label(L"リフレクター", x, y, 110);
+    add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 116, y, 236, 400, ID_REFL);
+    SendMessageW(ctl(ID_REFL), CB_SETDROPPEDWIDTH, (WPARAM)S(560), 0);
+    add(L"BUTTON", L"追加", BS_PUSHBUTTON | WS_TABSTOP, x + 358, y, 49, 25, ID_ADD);
+    add(L"BUTTON", L"削除", BS_PUSHBUTTON | WS_TABSTOP, x + 411, y, 49, 25, ID_DEL);
+    y += 32;
+    label(L"ホスト", x, y, 110);
+    add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, x + 116, y, 220, 24, ID_HOST);
+    label(L"ポート", x + 346, y, 40);
+    add(L"EDIT", L"17000", ES_NUMBER | WS_TABSTOP, x + 390, y, 70, 24, ID_PORT);
+    y += 32;
+    label(L"モジュール", x, y, 110);
+    add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 116, y, 60, 400, ID_MODULE);
+    for (int i = 0; i < 26; ++i) {
+        wchar_t m[2] = { (wchar_t)(L'A' + i), 0 };
+        SendMessageW(ctl(ID_MODULE), CB_ADDSTRING, 0, (LPARAM)m);
+    }
+    label(L"宛先", x + 196, y, 40);
+    add(L"EDIT", L"@ALL", ES_UPPERCASE | ES_AUTOHSCROLL | WS_TABSTOP, x + 240, y, 110, 24, ID_DEST);
+    SendMessageW(ctl(ID_DEST), EM_LIMITTEXT, 9, 0);
+    y += 32;
+    label(L"コールサイン", x, y, 110);
+    add(L"EDIT", L"", ES_UPPERCASE | ES_AUTOHSCROLL | WS_TABSTOP, x + 116, y, 110, 24, ID_CALL);
+    SendMessageW(ctl(ID_CALL), EM_LIMITTEXT, 9, 0);
+    add(L"STATIC", L"（9 文字まで）", SS_LEFT, x + 236, y + 3, 200, 20, 0);
+    y += 32;
+    label(L"マイク", x, y, 110);
+    add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 116, y, 344, 300, ID_MIC);
+    SendMessageW(ctl(ID_MIC), CB_ADDSTRING, 0, (LPARAM)L"Windows の既定");
+    for (int i = 0; i < mic_device_count(); ++i) {
+        char name[128];
+        wchar_t w[128];
+        if (mic_device_name(i, name, sizeof(name))) {
+            MultiByteToWideChar(CP_ACP, 0, name, -1, w, 128);
+            SendMessageW(ctl(ID_MIC), CB_ADDSTRING, 0, (LPARAM)w);
+        }
+    }
+    y += 32;
+    add(L"BUTTON", L"受信した通話を recordings\\ に保存", BS_AUTOCHECKBOX | WS_TABSTOP, x + 116, y, 344, 24, ID_SAVE);
+    y += 40;
+    add(L"BUTTON", L"接続", BS_PUSHBUTTON | WS_TABSTOP, x, y, 120, 36, ID_CONNECT);
+    add(L"BUTTON", L"パロットで試す", BS_PUSHBUTTON | WS_TABSTOP, x + 132, y, 150, 36, ID_PARROT);
+    add(L"STATIC", L"（自分の声が 1 秒後に返る）", SS_LEFT, x + 290, y + 9, 180, 20, 0);
+    y += 48;
+    HWND ptt = add(L"BUTTON", L"送信 PTT (F2)", BS_PUSHBUTTON | WS_TABSTOP, x, y, 200, 80, ID_PTT);
+    SendMessageW(ptt, WM_SETFONT, (WPARAM)s_big, TRUE);
+    EnableWindow(ptt, FALSE);
+    add(L"STATIC", L"未接続", SS_LEFT | SS_NOPREFIX, x + 214, y, 250, 22, ID_STATUS);
+    SendMessageW(ctl(ID_STATUS), WM_SETFONT, (WPARAM)s_big, TRUE);
+    add(L"STATIC", L"マイク", SS_LEFT, x + 214, y + 32, 50, 20, 0);
+    add(PROGRESS_CLASSW, L"", PBS_SMOOTH, x + 268, y + 34, 192, 14, ID_MICBAR);
+    add(L"STATIC", L"受信", SS_LEFT, x + 214, y + 56, 50, 20, 0);
+    add(PROGRESS_CLASSW, L"", PBS_SMOOTH, x + 268, y + 58, 192, 14, ID_RXBAR);
+    SendMessageW(ctl(ID_MICBAR), PBM_SETRANGE, 0, MAKELPARAM(0, 60));
+    SendMessageW(ctl(ID_RXBAR), PBM_SETRANGE, 0, MAKELPARAM(0, 60));
+    y += 92;
+    add(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, x, y, 460, 22, ID_RXINFO);
+    y += 28;
+    add(L"STATIC", L"送信は Codec 2 3200 です。受信は 3200 と 1600（音声＋データ）を再生します。",
+        SS_LEFT, x, y, 460, 40, 0);
+
+    int rx = 488;
+    add(L"STATIC", L"受信履歴", SS_LEFT, rx, 12, 200, 20, 0);
+    HWND lv = add(WC_LISTVIEWW, L"", LVS_REPORT | LVS_NOSORTHEADER | LVS_SINGLESEL, rx, 34, 460, 200, ID_HEARD);
+    ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    static const wchar_t *cols[5] = { L"時刻", L"コールサイン", L"宛先", L"方式", L"長さ" };
+    static const int widths[5] = { 70, 110, 110, 50, 80 };
+    for (int i = 0; i < 5; ++i) {
+        LVCOLUMNW c = { 0 };
+        c.mask = LVCF_TEXT | LVCF_WIDTH;
+        c.pszText = (wchar_t *)cols[i];
+        c.cx = S(widths[i]);
+        ListView_InsertColumn(lv, i, &c);
+    }
+    add(L"STATIC", L"ログ", SS_LEFT, rx, 244, 200, 20, 0);
+    add(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, rx, 266, 460, 226, ID_LOG);
+}
+
+static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_FILTER:
+            if (HIWORD(wp) == EN_CHANGE) {
+                fill_reflectors();
+            }
+            return 0;
+        case ID_REFL:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                pick_reflector();
+            }
+            return 0;
+        case ID_CONNECT:
+            do_connect();
+            return 0;
+        case ID_PTT:
+            toggle_ptt();
+            return 0;
+        case ID_PARROT:
+            toggle_parrot();
+            return 0;
+        case ID_ADD:
+            add_reflector();
+            return 0;
+        case ID_DEL:
+            delete_reflector();
+            return 0;
+        }
+        break;
+    case WM_TIMER:
+        update_status();
+        return 0;
+    case WM_LOGLINE:
+        append_log((const char *)lp);
+        free((void *)lp);
+        return 0;
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)lp == ctl(ID_STATUS)) {
+            me_status_t st;
+            me_get_status(&st);
+            SetTextColor((HDC)wp, st.tx ? RGB(0xC0, 0x10, 0x10) : (st.rx ? RGB(0x10, 0x70, 0x10) : RGB(0x30, 0x30, 0x30)));
+            SetBkMode((HDC)wp, TRANSPARENT);
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        break;
+    case WM_CLOSE:
+        if (s_connected) {
+            me_stop();
+        }
+        parrot_stop();
+        save_settings();
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
+{
+    (void)prev;
+    (void)cmd;
+    SetProcessDPIAware();
+    HDC dc = GetDC(NULL);
+    s_dpi = GetDeviceCaps(dc, LOGPIXELSY);
+    ReleaseDC(NULL, dc);
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS };
+    InitCommonControlsEx(&icc);
+
+    GetModuleFileNameW(NULL, s_dir, MAX_PATH);
+    wchar_t *slash = wcsrchr(s_dir, L'\\');
+    if (slash) {
+        *slash = 0;
+    }
+    swprintf(s_ini, MAX_PATH, L"%ls\\m17_pc.ini", s_dir);
+
+    NONCLIENTMETRICSW ncm;
+    memset(&ncm, 0, sizeof(ncm));
+    ncm.cbSize = sizeof(ncm);
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    ncm.lfMessageFont.lfHeight = -S(13);
+    s_font = CreateFontIndirectW(&ncm.lfMessageFont);
+    ncm.lfMessageFont.lfHeight = -S(17);
+    ncm.lfMessageFont.lfWeight = FW_BOLD;
+    s_big = CreateFontIndirectW(&ncm.lfMessageFont);
+
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"m17_pc";
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    RegisterClassW(&wc);
+    RECT r = { 0, 0, S(960), S(504) };
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE);
+    s_wnd = CreateWindowW(L"m17_pc", L"m17_pc  -  M17 リフレクター（Codec 2）",
+                          WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX),
+                          CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
+    create_controls();
+    load_reflectors();
+    load_settings();
+    fill_reflectors();
+    if (!s_refl_n) {
+        append_log("[W] no reflectors in hosts\\M17Hosts.txt: type the host yourself");
+    } else {
+        char line[96];
+        snprintf(line, sizeof(line), "%d reflectors in hosts\\M17Hosts.txt", s_refl_n);
+        append_log(line);
+    }
+    SetTimer(s_wnd, ID_TIMER, 100, NULL);
+    ShowWindow(s_wnd, show);
+
+    MSG m;
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_F2 && !(m.lParam & 0x40000000)) {
+            toggle_ptt();
+            continue;
+        }
+        if (!IsDialogMessageW(s_wnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    return 0;
+}

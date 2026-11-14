@@ -26,3 +26,10 @@ main/.git_unused/
 build_s3/
 sdkconfig.s3
 
+
+# M17 builds
+build_m17_pc/
+build_m17_modem_pc/
+m17_modem/esp32/build/
+m17_modem/esp32/sdkconfig
+m17_modem/esp32/sdkconfig.old

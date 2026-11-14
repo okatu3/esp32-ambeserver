@@ -1,0 +1,55 @@
+# M17 reflectors for m17_pc: NAME HOST PORT  # comment (shown in the list).
+# Source: N6JET M17 reflector list (from the M17 registry, English-speaking countries, verified 2026-07/08),
+# https://n6jet.com/m17-reflectors-english.html . Checked 2026-11-14: dashboard answered = no mark,
+# no or failing dashboard = (unverified). Reflectors come and go; add your own with the window's add button.
+
+# The built-in test reflector (start it first with the parrot button of m17_pc):
+PARROT   127.0.0.1   17000   # test reflector inside m17_pc
+
+M17-003  192.227.141.209              17000  # US RI DIGITALINK
+M17-005  45.77.223.78                 17000  # US M17
+M17-020  m17-020.k2ie.net             17000  # US 020 Digital Multiprotocol Group
+M17-049  xlx049.dyndns.org            17000  # US XLX049 M17 Reflector
+M17-097  104.207.138.151              17000  # US KC1VAX M17 Reflector
+M17-117  96.224.250.24                17000  # US Emergency Radio Long Island
+M17-137  xlx137.mywire.org            17000  # US XLX137 Reflector
+M17-207  m17-207.w1bsb.net            17000  # US W1BSB
+M17-218  m17-218.chaverimradio.com    17000  # US Chaverim Multimode Reflector
+M17-2MC  wg5eek.com                   17000  # US 2 Meter Crew Arkansas Radio Heads
+M17-315  xlx315.duckdns.org           17000  # US Wisconsin DMR
+M17-517  m17-517.radiosc.net          17000  # US RadioSC Linked M17 Reflector
+M17-556  m17-556.kq4tnv.net           17000  # US KQ4TNV Stafford Virginia
+M17-910  xlx910.mywire.org            17000  # US XLX910
+M17-BYG  m17.k0xm.net                 17000  # US Backyard Repeater Group Chat
+M17-DHN  doghousenet.com              17000  # US Doghouse Digital Network
+M17-JET  5.161.19.207                 17001  # US N6JET M17 Reflector
+M17-KCW  172.234.217.28               17000  # US Kansas City Wide Digital Network
+M17-M17  m17.openquad.net             17000  # US M17 Project Reflector (QuadNet)
+M17-NCA  m17-nca.dyndns.org           17000  # US K6HP
+M17-OBX  M17obx.duckdns.org           17000  # US Outer Banks
+M17-SCS  45.77.119.250                17000  # US SCARSVOIP
+M17-SEL  m17.lmarc.net                17000  # US Lookout Mountain ARC
+M17-SFI  45.79.74.165                 17000  # US Starfleet ARG - Trek Talk
+M17-405  66.179.209.30                17000  # CA XLX405A - 405
+M17-672  213.171.214.2                17000  # GB Pi-Star Multi-mode Reflector
+M17-DMR  m17.freestar.network         17000  # GB FreeSTAR Network
+M17-FOG  95.179.203.54                17000  # GB THE FOG
+M17-LEF  77.68.25.66                  17000  # GB LEFARS Multi-Reflector
+M17-SWD  45.32.239.121                17000  # GB South Wales Digital Group
+M17-WAL  192.248.172.148              17000  # GB Wales (SWDG)
+M17-432  112.213.34.65                17000  # AU VK3JED
+M17-434  45.124.54.132                17000  # AU VK5ZSH
+M17-CBR  m17-cbr.charlesmartin.au     17000  # AU M17-CBR
+M17-NZD  m17-nzd.dvnz.nz              17000  # NZ Digital Voice New Zealand
+
+M17-333  96.44.137.162                17001  # US M17 QQ (未確認)
+M17-396  96.44.137.162                17000  # US US-Keywork (未確認)
+M17-815  m17.we0fun.com               17000  # US Fun Machine Linked Repeater System (未確認)
+M17-OMO  5.78.179.25                  17000  # US PRIDE (未確認)
+M17-PLG  54.85.206.3                  17000  # US East PA Reflector (未確認)
+M17-PPP  69.251.56.54                 17000  # US M17-PPP (未確認)
+M17-SAT  45.56.111.31                 17000  # US AMSAT (未確認)
+M17-UT0  utah00.utahdrn.org           17000  # US Utah DRN M17 (未確認)
+M17-WIL  node64189.ddns.net           17000  # US KE7WIL Personal M17 Reflector (未確認)
+M17-427  15.157.128.240               17000  # CA XLX427A - M17 427 (未確認)
+M17-922  81.150.10.63                 17000  # GB CQ-UK (未確認)
