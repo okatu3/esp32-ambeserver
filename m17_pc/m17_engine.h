@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "m17.h"
+#include "radio_win.h"
 
 #define ME_HEARD_N 20
 
@@ -24,6 +25,18 @@ typedef struct {
     char wav_dir[260];             /* "" = do not save calls */
     char tx_wav[260];              /* tests: transmit this WAV (8 kHz mono 16 bit) instead of the microphone */
     bool no_speaker;               /* tests */
+    bool radio;                    /* talk to a radio through the sound card (radio_win.c) instead of a reflector */
+    radio_cfg_t rc;
+    /* relay (gateway): radio and reflector at the same time, one call at a time; our own PTT goes to both */
+    bool gateway;                  /* needs radio = true and a reflector host */
+    bool gw_rf_to_net;             /* calls heard on the radio -> reflector (default on) */
+    bool gw_net_to_rf;             /* calls from the reflector -> transmitted by our radio (default off) */
+    bool gw_keep_src;              /* reflector -> radio: keep the caller's callsign as source (default: ours) */
+    unsigned gw_cushion_ms;        /* reflector -> radio: extra silence before the call (default 200) */
+    /* loopback tests: another station calls on the radio channel test_rf_at seconds after the start */
+    char test_rf_wav[260];         /* 8 kHz mono 16 bit */
+    char test_rf_call[M17_CALL_LEN];
+    float test_rf_at;
 } me_cfg_t;
 
 typedef enum { ML_OFF, ML_CONNECTING, ML_UP, ML_REFUSED } me_link_t;
@@ -36,6 +49,8 @@ typedef struct {
 
 typedef struct {
     me_link_t link;
+    bool radio_up;                 /* radio or relay mode: the sound card is open */
+    uint32_t gw_up_calls, gw_down_calls;   /* calls relayed radio -> reflector / reflector -> radio */
     char reflector[M17_CALL_LEN];  /* callsign the reflector gives in PING, e.g. "M17-XXX" */
     bool tx, rx;
     float tx_seconds;

@@ -8,6 +8,16 @@
  *     --wav DIR          save received calls            -n            no speaker
  *     --mic N / --spk N  devices (see -l)               --jitter MS   --tx-gain dB   --rx-gain dB
  *   m17_cli parrot CALLSIGN [options]                 (the built-in test reflector on 127.0.0.1:--port, default 17000)
+ *   m17_cli radio CALLSIGN [options]                  (a radio on the sound card, 4FSK made here, see radio_win.h)
+ *     --rin N / --rout N sound input / output of the radio (see -l)
+ *     --ptt COM5:rts     PTT on a serial port: rts, dtr or civ (Icom; --civ-addr A4 --civ-baud 115200)
+ *     --tx-level dBFS    level of the +3 symbols (-10)  --tx-delay MS  silence after keying (150)  --tx-invert
+ *     --loop             no sound card: the output goes straight back to the input (tests)
+ *     --loop-snr dB      with noise                     --loop-voice-band  through 300 Hz - 3 kHz filters both ways
+ *   m17_cli HOST CALLSIGN --relay [radio options]    (relay: the radio and a reflector at the same time)
+ *     radio -> reflector is on (--no-relay-to-net turns it off); --relay-to-radio also transmits the reflector's
+ *     calls on the radio, with our callsign as source (--relay-keep-src: the caller's).
+ *     --test-rf WAV:CALL:S  with --loop: CALL calls on the radio channel S seconds after the start (tests)
  *   m17_cli -l           list microphones and speakers
  * A transmission is started here only by --tx-wav: this program has no PTT key. */
 #define WIN32_LEAN_AND_MEAN
@@ -73,6 +83,11 @@ int main(int argc, char **argv)
                         "       [--tx-at S] [--wav DIR] [-n] [--mic N] [--spk N] [--jitter MS]\n"
                         "       [--tx-gain dB] [--rx-gain dB]\n"
                         "   or: m17_cli parrot CALLSIGN [same options]   (built-in test reflector on 127.0.0.1)\n"
+                        "   or: m17_cli radio CALLSIGN [same options] [--rin N] [--rout N] [--ptt COM5:rts|dtr|civ]\n"
+                        "       [--civ-addr A4] [--civ-baud 115200] [--tx-level dBFS] [--tx-delay MS] [--tx-invert]\n"
+                        "       [--loop [--loop-snr dB] [--loop-voice-band]]   (a radio on the sound card; --loop: tests)\n"
+                        "   or: m17_cli HOST CALLSIGN --relay [radio options] [--relay-to-radio] [--relay-keep-src]\n"
+                        "       [--no-relay-to-net] [--test-rf WAV:CALL:SECONDS]   (relay between a radio and a reflector)\n"
                         "   or: m17_cli -l\n");
         return 2;
     }
@@ -95,10 +110,50 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--jitter")) { c.jitter_ms = (unsigned)atoi(v); ++i; }
         else if (!strcmp(a, "--tx-gain")) { c.tx_gain_db = (float)atof(v); ++i; }
         else if (!strcmp(a, "--rx-gain")) { c.rx_gain_db = (float)atof(v); ++i; }
+        else if (!strcmp(a, "--rin")) { c.rc.in_device = atoi(v); ++i; }
+        else if (!strcmp(a, "--rout")) { c.rc.out_device = atoi(v); ++i; }
+        else if (!strcmp(a, "--loop")) { c.rc.in_device = c.rc.out_device = RADIO_DEV_LOOP; }
+        else if (!strcmp(a, "--loop-snr")) { c.rc.loop_snr_db = (float)atof(v); ++i; }
+        else if (!strcmp(a, "--loop-voice-band")) { c.rc.loop_voice_band = true; }
+        else if (!strcmp(a, "--ptt")) {                     /* COM5:rts | COM5:dtr | COM5:civ */
+            char port[16] = "", how[8] = "";
+            sscanf(v, "%15[^:]:%7s", port, how);
+            snprintf(c.rc.ptt_port, sizeof(c.rc.ptt_port), "%s", port);
+            c.rc.ptt = !_stricmp(how, "dtr") ? RP_DTR : (!_stricmp(how, "civ") ? RP_CIV : RP_RTS);
+            ++i;
+        }
+        else if (!strcmp(a, "--civ-addr")) { c.rc.civ_addr = (unsigned)strtoul(v, NULL, 16); ++i; }
+        else if (!strcmp(a, "--civ-baud")) { c.rc.civ_baud = (unsigned)atoi(v); ++i; }
+        else if (!strcmp(a, "--tx-level")) { c.rc.tx_dbfs = (float)atof(v); ++i; }
+        else if (!strcmp(a, "--tx-delay")) { c.rc.tx_delay_ms = (unsigned)atoi(v); ++i; }
+        else if (!strcmp(a, "--tx-invert")) { c.rc.tx_invert = true; }
+        else if (!strcmp(a, "--relay")) { c.radio = c.gateway = true; }
+        else if (!strcmp(a, "--relay-to-radio")) { c.gw_net_to_rf = true; }
+        else if (!strcmp(a, "--no-relay-to-net")) { c.gw_rf_to_net = false; }
+        else if (!strcmp(a, "--relay-keep-src")) { c.gw_keep_src = true; }
+        else if (!strcmp(a, "--test-rf")) {                 /* WAV[:CALL[:SECONDS]] */
+            char w[260] = "", call[16] = "", at[16] = "";
+            snprintf(w, sizeof(w), "%s", v);
+            /* the WAV path may hold a drive letter: split only on colons after it */
+            char *q = strchr(w + (w[1] == ':' ? 2 : 0), ':');
+            if (q) {
+                *q++ = 0;
+                sscanf(q, "%15[^:]:%15s", call, at);
+            }
+            snprintf(c.test_rf_wav, sizeof(c.test_rf_wav), "%s", w);
+            snprintf(c.test_rf_call, sizeof(c.test_rf_call), "%s", call);
+            upper(c.test_rf_call);
+            c.test_rf_at = at[0] ? (float)atof(at) : 2.0f;
+            ++i;
+        }
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGINT, on_signal);
+    if (!strcmp(c.host, "radio")) {
+        c.radio = true;
+        c.gateway = false;
+    }
     bool parrot = !strcmp(c.host, "parrot");
     if (parrot) {
         if (!c.port) {

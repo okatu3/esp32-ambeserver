@@ -1,7 +1,11 @@
 /* m17_pc: a window for the M17 station of m17_engine.c.
  * Left: reflector (hosts\M17Hosts.txt, filtered as you type), host and port, module, callsign, destination,
  * microphone, connect, the PTT (F2 toggles it like the button), meters. Right: the call being heard, last heard
- * and the log. Settings are kept in m17_pc.ini next to the program. */
+ * and the log. Settings are kept in m17_pc.ini next to the program.
+ * Mode "無線機": instead of a reflector, an FM radio on the sound card (4FSK made here, radio_win.c); its devices and
+ * PTT are set in a small dialog and kept in the [radio] section of m17_pc.ini.
+ * Mode "中継": the radio and the reflector at the same time; calls heard on the radio go to the reflector, and (only
+ * if ticked in the dialog) calls from the reflector are transmitted by the radio. */
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
@@ -17,10 +21,11 @@
 #include "m17_engine.h"
 #include "m17_parrot.h"
 #include "mic_win.h"
+#include "radio_win.h"
 
 enum {
     ID_FILTER = 100, ID_REFL, ID_HOST, ID_PORT, ID_MODULE, ID_CALL, ID_DEST, ID_MIC, ID_SAVE, ID_CONNECT, ID_PTT,
-    ID_STATUS, ID_RXINFO, ID_MICBAR, ID_RXBAR, ID_HEARD, ID_LOG, ID_PARROT, ID_ADD, ID_DEL, ID_TIMER = 1, WM_LOGLINE = WM_APP + 1
+    ID_STATUS, ID_RXINFO, ID_MICBAR, ID_RXBAR, ID_HEARD, ID_LOG, ID_PARROT, ID_ADD, ID_DEL, ID_MODE, ID_RADIOSET, ID_TIMER = 1, WM_LOGLINE = WM_APP + 1
 };
 
 static HWND s_wnd, s_ctl[64];
@@ -251,6 +256,16 @@ static void ini_put(const wchar_t *key, int id)
     WritePrivateProfileStringW(L"m17_pc", key, v, s_ini);
 }
 
+static int mode_sel(void)                         /* 0 reflector, 1 radio, 2 relay */
+{
+    return (int)SendMessageW(ctl(ID_MODE), CB_GETCURSEL, 0, 0);
+}
+
+static bool radio_mode(void)                       /* the sound card is used (radio or relay) */
+{
+    return mode_sel() >= 1;
+}
+
 static void load_settings(void)
 {
     ini_get(L"host", L"", ID_HOST);
@@ -263,6 +278,8 @@ static void load_settings(void)
     int mic = GetPrivateProfileIntW(L"m17_pc", L"mic", -1, s_ini);
     SendMessageW(ctl(ID_MIC), CB_SETCURSEL, (WPARAM)(mic + 1), 0);
     SendMessageW(ctl(ID_SAVE), BM_SETCHECK, GetPrivateProfileIntW(L"m17_pc", L"save_rx", 0, s_ini) ? BST_CHECKED : 0, 0);
+    int md = GetPrivateProfileIntW(L"m17_pc", L"mode", 0, s_ini);
+    SendMessageW(ctl(ID_MODE), CB_SETCURSEL, (WPARAM)(md >= 0 && md <= 2 ? md : 0), 0);
 }
 
 static void save_settings(void)
@@ -279,6 +296,9 @@ static void save_settings(void)
     WritePrivateProfileStringW(L"m17_pc", L"mic", v, s_ini);
     WritePrivateProfileStringW(L"m17_pc", L"save_rx",
                                SendMessageW(ctl(ID_SAVE), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0", s_ini);
+    wchar_t ms[4];
+    swprintf(ms, 4, L"%d", mode_sel());
+    WritePrivateProfileStringW(L"m17_pc", L"mode", ms, s_ini);
 }
 
 static void get_a(int id, char *out, int size)
@@ -460,6 +480,211 @@ static bool prompt(const wchar_t *title, const wchar_t *text, wchar_t *io, int s
     return P.ok;
 }
 
+/* ---------------------------------------------------------------- radio settings ([radio] in m17_pc.ini) */
+static int rini(const wchar_t *key, int def)
+{
+    return (int)GetPrivateProfileIntW(L"radio", key, def, s_ini);
+}
+
+static void radio_cfg_from_ini(radio_cfg_t *c)
+{
+    radio_default_cfg(c);
+    c->in_device = rini(L"in", RADIO_DEV_DEFAULT);
+    c->out_device = rini(L"out", RADIO_DEV_DEFAULT);
+    c->ptt = (radio_ptt_t)rini(L"ptt", RP_NONE);
+    if (c->ptt > RP_CIV) {
+        c->ptt = RP_NONE;
+    }
+    wchar_t w[32];
+    GetPrivateProfileStringW(L"radio", L"port", L"", w, 32, s_ini);
+    WideCharToMultiByte(CP_ACP, 0, w, -1, c->ptt_port, sizeof(c->ptt_port), NULL, NULL);
+    GetPrivateProfileStringW(L"radio", L"civ_addr", L"A4", w, 32, s_ini);
+    c->civ_addr = (unsigned)wcstoul(w, NULL, 16) & 0xFF;
+    c->civ_baud = (unsigned)rini(L"civ_baud", 115200);
+    c->tx_dbfs = (float)rini(L"tx_level_db", -10);
+    c->tx_delay_ms = (unsigned)rini(L"tx_delay_ms", 150);
+    c->tx_tail_ms = (unsigned)rini(L"tx_tail_ms", 50);
+    c->tx_invert = rini(L"tx_invert", 0) != 0;
+}
+
+static void wput_int(const wchar_t *key, int v)
+{
+    wchar_t w[16];
+    swprintf(w, 16, L"%d", v);
+    WritePrivateProfileStringW(L"radio", key, w, s_ini);
+}
+
+enum { RD_IN = 300, RD_OUT, RD_PTT, RD_PORT, RD_ADDR, RD_BAUD, RD_LEVEL, RD_DELAY, RD_INV, RD_N2R, RD_KEEP };
+static struct {
+    HWND wnd;
+    bool done, ok;
+} RDLG;
+
+static LRESULT CALLBACK radio_dlg_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            RDLG.ok = LOWORD(wp) == IDOK;
+            RDLG.done = true;
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        RDLG.done = true;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static HWND rd_add(const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id)
+{
+    HWND c = CreateWindowExW(!wcscmp(cls, L"EDIT") ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                             S(x), S(y), S(w), S(h), RDLG.wnd, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
+    SendMessageW(c, WM_SETFONT, (WPARAM)s_font, TRUE);
+    return c;
+}
+
+static void rd_devices(HWND cb, bool input, int cur)
+{
+    SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"Windows の既定");
+    SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"内部で折り返す（試験・音は出ない）");
+    int n = input ? radio_in_count() : radio_out_count();
+    for (int i = 0; i < n; ++i) {
+        char a[96];
+        wchar_t w[96];
+        if (input ? radio_in_name(i, a, sizeof(a)) : radio_out_name(i, a, sizeof(a))) {
+            MultiByteToWideChar(CP_ACP, 0, a, -1, w, 96);
+            SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)w);
+        }
+    }
+    SendMessageW(cb, CB_SETCURSEL, (WPARAM)(cur == RADIO_DEV_LOOP ? 1 : cur + 1), 0);
+}
+
+static int rd_device(HWND cb)
+{
+    int i = (int)SendMessageW(cb, CB_GETCURSEL, 0, 0);
+    return i <= 0 ? RADIO_DEV_DEFAULT : (i == 1 ? RADIO_DEV_LOOP : i - 2);
+}
+
+static void radio_settings(void)
+{
+    static bool registered;
+    if (!registered) {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = radio_dlg_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"m17_pc_radio";
+        RegisterClassW(&wc);
+        registered = true;
+    }
+    radio_cfg_t c;
+    radio_cfg_from_ini(&c);
+    RECT pr, r = { 0, 0, S(520), S(470) };
+    GetWindowRect(s_wnd, &pr);
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&r, style, FALSE);
+    int w = r.right - r.left, hgt = r.bottom - r.top;
+    RDLG.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"m17_pc_radio", L"無線機の設定", style,
+                               pr.left + ((pr.right - pr.left) - w) / 2, pr.top + S(60), w, hgt, s_wnd, NULL,
+                               GetModuleHandleW(NULL), NULL);
+    int y = 12;
+    rd_add(L"STATIC", L"無線機の DATA 端子（9600bps 用）を、PC の音声入出力につなぎます。",
+           SS_LEFT, 12, y, 496, 20, 0);
+    y += 30;
+    rd_add(L"STATIC", L"入力（無線機から）", SS_LEFT, 12, y + 3, 130, 20, 0);
+    HWND in = rd_add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 146, y, 362, 300, RD_IN);
+    rd_devices(in, true, c.in_device);
+    y += 32;
+    rd_add(L"STATIC", L"出力（無線機へ）", SS_LEFT, 12, y + 3, 130, 20, 0);
+    HWND out = rd_add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 146, y, 362, 300, RD_OUT);
+    rd_devices(out, false, c.out_device);
+    y += 40;
+    rd_add(L"STATIC", L"PTT", SS_LEFT, 12, y + 3, 130, 20, 0);
+    HWND ptt = rd_add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, 146, y, 200, 200, RD_PTT);
+    static const wchar_t *pn[4] = { L"なし（VOX・手動）", L"RTS", L"DTR", L"CI-V（Icom）" };
+    for (int i = 0; i < 4; ++i) {
+        SendMessageW(ptt, CB_ADDSTRING, 0, (LPARAM)pn[i]);
+    }
+    SendMessageW(ptt, CB_SETCURSEL, (WPARAM)c.ptt, 0);
+    rd_add(L"STATIC", L"ポート", SS_LEFT, 360, y + 3, 50, 20, 0);
+    wchar_t t[32];
+    swprintf(t, 32, L"%hs", c.ptt_port);
+    HWND port = rd_add(L"EDIT", t, ES_UPPERCASE | ES_AUTOHSCROLL | WS_TABSTOP, 412, y, 96, 24, RD_PORT);
+    y += 32;
+    rd_add(L"STATIC", L"CI-V アドレス（16進）", SS_LEFT, 12, y + 3, 150, 20, 0);
+    swprintf(t, 32, L"%02X", c.civ_addr);
+    HWND addr = rd_add(L"EDIT", t, ES_UPPERCASE | WS_TABSTOP, 166, y, 50, 24, RD_ADDR);
+    rd_add(L"STATIC", L"速度", SS_LEFT, 232, y + 3, 40, 20, 0);
+    swprintf(t, 32, L"%u", c.civ_baud);
+    HWND baud = rd_add(L"EDIT", t, ES_NUMBER | WS_TABSTOP, 274, y, 80, 24, RD_BAUD);
+    rd_add(L"STATIC", L"IC-705 は A4", SS_LEFT, 366, y + 3, 140, 20, 0);
+    y += 40;
+    rd_add(L"STATIC", L"送信レベル（dBFS）", SS_LEFT, 12, y + 3, 150, 20, 0);
+    swprintf(t, 32, L"%d", (int)c.tx_dbfs);
+    HWND level = rd_add(L"EDIT", t, WS_TABSTOP, 166, y, 50, 24, RD_LEVEL);
+    rd_add(L"STATIC", L"送信遅延（ms）", SS_LEFT, 232, y + 3, 110, 20, 0);
+    swprintf(t, 32, L"%u", c.tx_delay_ms);
+    HWND delay = rd_add(L"EDIT", t, ES_NUMBER | WS_TABSTOP, 346, y, 60, 24, RD_DELAY);
+    y += 32;
+    HWND inv = rd_add(L"BUTTON", L"送信の変調を反転する（相手のログに inverted と出るとき）", BS_AUTOCHECKBOX | WS_TABSTOP, 12, y,
+                      496, 24, RD_INV);
+    SendMessageW(inv, BM_SETCHECK, c.tx_invert ? BST_CHECKED : 0, 0);
+    y += 34;
+    rd_add(L"STATIC", L"中継モード：無線機で受けた通話は、いつもリフレクターへ送ります。", SS_LEFT, 12, y, 496, 20, 0);
+    y += 24;
+    HWND n2r = rd_add(L"BUTTON", L"リフレクターの通話を、無線機から送信する（自動で電波が出ます）", BS_AUTOCHECKBOX | WS_TABSTOP,
+                      12, y, 496, 24, RD_N2R);
+    SendMessageW(n2r, BM_SETCHECK, rini(L"relay_to_radio", 0) ? BST_CHECKED : 0, 0);
+    y += 26;
+    HWND keep = rd_add(L"BUTTON", L"そのとき送信元を相手のコールサインのままにする（既定は自局のコールサイン）",
+                       BS_AUTOCHECKBOX | WS_TABSTOP, 30, y, 478, 24, RD_KEEP);
+    SendMessageW(keep, BM_SETCHECK, rini(L"relay_keep_src", 0) ? BST_CHECKED : 0, 0);
+    y += 34;
+    rd_add(L"STATIC",
+           L"マイク端子・スピーカー端子では通りません（300 Hz〜3 kHz の帯域では復調できないことを試験で確認）。"
+           L"送信の前に、免許の範囲か確かめてください。調整はダミーロードで。",
+           SS_LEFT, 12, y, 496, 60, 0);
+    y += 70;
+    rd_add(L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP, 332, y, 84, 28, IDOK);
+    rd_add(L"BUTTON", L"やめる", WS_TABSTOP, 424, y, 84, 28, IDCANCEL);
+
+    RDLG.done = RDLG.ok = false;
+    EnableWindow(s_wnd, FALSE);
+    ShowWindow(RDLG.wnd, SW_SHOW);
+    MSG m;
+    while (!RDLG.done && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(RDLG.wnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    if (RDLG.ok) {
+        wput_int(L"in", rd_device(in));
+        wput_int(L"out", rd_device(out));
+        wput_int(L"ptt", (int)SendMessageW(ptt, CB_GETCURSEL, 0, 0));
+        GetWindowTextW(port, t, 32);
+        WritePrivateProfileStringW(L"radio", L"port", t, s_ini);
+        GetWindowTextW(addr, t, 32);
+        WritePrivateProfileStringW(L"radio", L"civ_addr", t, s_ini);
+        GetWindowTextW(baud, t, 32);
+        WritePrivateProfileStringW(L"radio", L"civ_baud", t, s_ini);
+        GetWindowTextW(level, t, 32);
+        wput_int(L"tx_level_db", _wtoi(t) > 0 ? 0 : _wtoi(t));
+        GetWindowTextW(delay, t, 32);
+        WritePrivateProfileStringW(L"radio", L"tx_delay_ms", t, s_ini);
+        wput_int(L"tx_invert", SendMessageW(inv, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        wput_int(L"relay_to_radio", SendMessageW(n2r, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        wput_int(L"relay_keep_src", SendMessageW(keep, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        append_logw(L"無線機の設定を保存しました");
+    }
+    EnableWindow(s_wnd, TRUE);
+    DestroyWindow(RDLG.wnd);
+    SetForegroundWindow(s_wnd);
+}
+
 /* ---------------------------------------------------------------- add to / delete from the reflector list */
 static void add_reflector(void)
 {
@@ -574,7 +799,8 @@ static void delete_reflector(void)
 /* ---------------------------------------------------------------- connect / PTT */
 static void set_enabled_fields(bool on)
 {
-    static const int ids[] = { ID_FILTER, ID_REFL, ID_HOST, ID_PORT, ID_MODULE, ID_CALL, ID_DEST, ID_MIC, ID_SAVE, ID_DEL };
+    static const int ids[] = { ID_FILTER, ID_REFL, ID_HOST, ID_PORT, ID_MODULE, ID_CALL, ID_DEST, ID_MIC, ID_SAVE, ID_DEL,
+                               ID_MODE, ID_RADIOSET };
     for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); ++i) {
         EnableWindow(ctl(ids[i]), on);
     }
@@ -609,7 +835,36 @@ static void do_connect(void)
         CreateDirectoryW(d, NULL);
         WideCharToMultiByte(CP_ACP, 0, d, -1, c.wav_dir, sizeof(c.wav_dir), NULL, NULL);
     }
-    if (!c.host[0] || !c.callsign[0]) {
+    if (radio_mode()) {
+        c.radio = true;
+        radio_cfg_from_ini(&c.rc);
+        c.gateway = mode_sel() == 2;
+        c.gw_net_to_rf = rini(L"relay_to_radio", 0) != 0;
+        c.gw_keep_src = rini(L"relay_keep_src", 0) != 0;
+        c.gw_cushion_ms = (unsigned)rini(L"relay_cushion_ms", 200);
+        if (!c.gateway) {
+            snprintf(c.host, sizeof(c.host), "radio");
+        }
+        if (c.gateway && c.gw_net_to_rf && c.rc.in_device != RADIO_DEV_LOOP && c.rc.out_device != RADIO_DEV_LOOP) {
+            int a = MessageBoxW(s_wnd,
+                                L"中継モードで「リフレクターの通話を無線機から送信する」が入っています。\n"
+                                L"リフレクターに誰かが話すたびに、あなたの無線機から自動で電波が出ます。\n\n"
+                                L"・ほかの人の通話を自局の電波で送ることが、あなたの免許・運用の条件で認められているか確かめてください。\n"
+                                L"・無人で動かさず、そばで監視してください。\n"
+                                L"・調整のうちはダミーロードで。\n\n"
+                                L"この設定で接続しますか？",
+                                L"m17_pc  中継の確認", MB_OKCANCEL | MB_ICONWARNING);
+            if (a != IDOK) {
+                return;
+            }
+        }
+        if (c.rc.ptt != RP_NONE && !c.rc.ptt_port[0]) {
+            MessageBoxW(s_wnd, L"「無線機の設定」で PTT のポート（COM5 など）を入れてください。", L"m17_pc",
+                        MB_ICONINFORMATION);
+            return;
+        }
+    }
+    if ((!c.radio && !c.host[0]) || !c.callsign[0]) {
         MessageBoxW(s_wnd, L"リフレクター（ホスト）とコールサインを入れてください。", L"m17_pc", MB_ICONINFORMATION);
         return;
     }
@@ -669,6 +924,22 @@ static void toggle_ptt(void)
     if (!s_connected || st.link != ML_UP) {
         return;
     }
+    if (!st.tx && !s_warned && radio_mode()) {
+        radio_cfg_t rc;
+        radio_cfg_from_ini(&rc);
+        if (rc.in_device != RADIO_DEV_LOOP && rc.out_device != RADIO_DEV_LOOP) {
+            int a = MessageBoxW(s_wnd,
+                                L"無線機から M17 の電波が出ます。\n"
+                                L"M17（4値FSK）での送信が、あなたの無線局の免許の範囲に入っているか確かめてください。\n"
+                                L"調整のうちは、アンテナの代わりにダミーロードをつないでください。\n\n"
+                                L"送信しますか？（この確認は、このアプリを閉じるまで一度だけ出ます）",
+                                L"m17_pc  送信の確認", MB_OKCANCEL | MB_ICONWARNING);
+            if (a != IDOK) {
+                return;
+            }
+        }
+        s_warned = true;
+    }
     if (!st.tx && !s_warned && !to_parrot()) {
         int a = MessageBoxW(s_wnd,
                             L"送信した声は、リフレクターにつながっている世界中の局に届きます。\n"
@@ -716,6 +987,10 @@ static void update_status(void)
     } else if (st.link == ML_UP) {
         if (st.rx) {
             wcscpy(t, L"受信中");
+        } else if (!strcmp(st.reflector, "RADIO")) {
+            wcscpy(t, L"無線機  待受");
+        } else if (st.radio_up) {
+            swprintf(t, 300, L"中継中  %hs", st.reflector[0] ? st.reflector : "");
         } else if (st.reflector[0]) {
             swprintf(t, 300, L"接続中  %hs", st.reflector);
         } else {
@@ -772,6 +1047,14 @@ static void update_status(void)
 static void create_controls(void)
 {
     int x = 12, y = 12;
+    label(L"接続先", x, y, 110);
+    add(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 116, y, 236, 200, ID_MODE);
+    SendMessageW(ctl(ID_MODE), CB_ADDSTRING, 0, (LPARAM)L"リフレクター（インターネット）");
+    SendMessageW(ctl(ID_MODE), CB_ADDSTRING, 0, (LPARAM)L"無線機（サウンドカード）");
+    SendMessageW(ctl(ID_MODE), CB_ADDSTRING, 0, (LPARAM)L"中継（無線機 ⇔ リフレクター）");
+    SendMessageW(ctl(ID_MODE), CB_SETCURSEL, 0, 0);
+    add(L"BUTTON", L"無線機の設定…", BS_PUSHBUTTON | WS_TABSTOP, x + 358, y, 102, 25, ID_RADIOSET);
+    y += 32;
     label(L"一覧の絞り込み", x, y, 110);
     add(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, x + 116, y, 140, 24, ID_FILTER);
     add(L"STATIC", L"（名前・ホストの一部）", SS_LEFT, x + 264, y + 3, 200, 20, 0);
@@ -851,7 +1134,7 @@ static void create_controls(void)
         ListView_InsertColumn(lv, i, &c);
     }
     add(L"STATIC", L"ログ", SS_LEFT, rx, 244, 200, 20, 0);
-    add(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, rx, 266, 460, 226, ID_LOG);
+    add(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, rx, 266, 460, 258, ID_LOG);
 }
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -883,6 +1166,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case ID_DEL:
             delete_reflector();
+            return 0;
+        case ID_RADIOSET:
+            radio_settings();
             return 0;
         }
         break;
@@ -953,9 +1239,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     wc.lpszClassName = L"m17_pc";
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     RegisterClassW(&wc);
-    RECT r = { 0, 0, S(960), S(504) };
+    RECT r = { 0, 0, S(960), S(536) };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE);
-    s_wnd = CreateWindowW(L"m17_pc", L"m17_pc  -  M17 リフレクター（Codec 2）",
+    s_wnd = CreateWindowW(L"m17_pc", L"m17_pc  -  M17（Codec 2）  リフレクター／無線機",
                           WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX),
                           CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     create_controls();

@@ -30,6 +30,9 @@ static CRITICAL_SECTION s_cs;
 static me_status_t s_st;
 static LARGE_INTEGER s_freq;
 static struct CODEC2 *s_c3200_tx, *s_c3200_rx, *s_c1600_rx;
+static radio_t *s_radio;                  /* radio mode: the sound-card modem instead of the UDP socket */
+static bool s_use_net;                        /* the reflector link is used (reflector or relay mode) */
+static uint8_t s_sil3200[8];              /* Codec 2 3200 frame of silence (ends a relayed call cleanly) */
 
 static double now_ms(void)
 {
@@ -83,6 +86,9 @@ void me_default_cfg(me_cfg_t *c)
     c->mic_device = c->spk_device = -1;
     c->jitter_ms = 300;
     c->tot_s = 180;
+    radio_default_cfg(&c->rc);
+    c->gw_rf_to_net = true;
+    c->gw_cushion_ms = 200;
 }
 
 static void set_link(me_link_t l)
@@ -189,7 +195,146 @@ static struct {
     unsigned frames;                      /* 20 ms frames played */
     wav_t wav;
     audio_stats_t at_start;
+    bool from_rf;
 } R;
+
+/* ---------------------------------------------------------------- relay (gateway) */
+static struct {
+    bool up;                              /* this call: radio -> reflector */
+    uint16_t up_sid, up_fn;
+    unsigned up_packets;
+    bool down;                            /* this call: reflector -> radio */
+    uint16_t down_fn;
+    unsigned down_packets;
+    double start;
+    unsigned under0;                      /* radio output underruns when the call started */
+} G;
+
+static uint16_t new_stream_id(void)
+{
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    uint32_t h = (uint32_t)q.QuadPart * 2654435761u ^ (uint32_t)(q.QuadPart >> 32) ^ GetTickCount();
+    h ^= h >> 16;
+    return (uint16_t)(h % 0xFFFE + 1);
+}
+
+static void udp_send(const uint8_t *p, size_t n);
+
+static void make_lsf(const char *dst, const char *src, uint16_t type, uint8_t lsf[M17_LSF_BYTES])
+{
+    memset(lsf, 0, M17_LSF_BYTES);
+    m17_encode_call(dst, lsf);
+    m17_encode_call(src, lsf + 6);
+    lsf[12] = (uint8_t)(type >> 8);
+    lsf[13] = (uint8_t)type;
+    uint16_t crc = m17_crc(lsf, 28);
+    lsf[28] = (uint8_t)(crc >> 8);
+    lsf[29] = (uint8_t)crc;
+}
+
+static void gw_up_send(const uint8_t payload[16], uint16_t type, bool last)
+{
+    m17_stream_t u;
+    memset(&u, 0, sizeof(u));
+    u.stream_id = G.up_sid;
+    snprintf(u.src, sizeof(u.src), "%s", R.call);
+    snprintf(u.dst, sizeof(u.dst), "%s", R.dest);
+    u.type = type;
+    u.fn = G.up_fn;
+    u.last = last;
+    memcpy(u.payload, payload, 16);
+    uint8_t pkt[M17_STREAM_LEN];
+    m17_build_stream(&u, pkt);
+    udp_send(pkt, sizeof(pkt));
+    G.up_fn = (uint16_t)((G.up_fn + 1) & 0x7FFF);
+    G.up_packets++;
+}
+
+/* a call starts being heard: decide whether and where it is relayed */
+static void gw_start(const m17_stream_t *s, bool from_rf, double t)
+{
+    memset(&G, 0, sizeof(G));
+    if (!s_cfg.gateway || !s_radio || !s_use_net) {
+        return;
+    }
+    G.start = t;
+    G.under0 = radio_stats(s_radio)->tx_underruns;
+    if (from_rf && s_cfg.gw_rf_to_net && s_st.link == ML_UP) {
+        G.up = true;
+        G.up_sid = new_stream_id();
+        logf_("    relay: radio -> reflector");
+    } else if (!from_rf && s_cfg.gw_net_to_rf) {
+        uint8_t lsf[M17_LSF_BYTES];
+        make_lsf(s->dst, s_cfg.gw_keep_src ? s->src : s_cfg.callsign, s->type, lsf);
+        radio_tx_begin_ex(s_radio, lsf, s_cfg.gw_cushion_ms);
+        G.down = true;
+        logf_("    relay: reflector -> radio (transmitting as %s)", s_cfg.gw_keep_src ? s->src : s_cfg.callsign);
+    }
+}
+
+/* the call ends (last packet, end of signal, time-out or cut): close what was relayed */
+static void gw_stop(const char *why)
+{
+    static const uint8_t zero[16];
+    uint8_t sil[16];
+    memcpy(sil, s_sil3200, 8);
+    memcpy(sil + 8, s_sil3200, 8);
+    if (G.up) {
+        gw_up_send(sil, M17_TYPE_V3200, true);
+        G.up = false;
+    }
+    if (G.down) {
+        radio_tx_frame(s_radio, G.down_fn, true, zero);
+        radio_tx_end(s_radio);
+        G.down = false;
+    }
+    if (G.up_packets || G.down_packets) {
+        unsigned under = radio_stats(s_radio)->tx_underruns - G.under0;
+        logf_("    relay end%s: %u packets to the reflector, %u frames on the radio%s", why, G.up_packets, G.down_packets,
+              under ? "  [the radio ran dry: packets came too late, raise relay_cushion_ms]" : "");
+        EnterCriticalSection(&s_cs);
+        s_st.gw_up_calls += G.up_packets > 0;
+        s_st.gw_down_calls += G.down_packets > 0;
+        LeaveCriticalSection(&s_cs);
+        G.up_packets = G.down_packets = 0;
+    }
+}
+
+/* one packet of the call being heard */
+static void gw_packet(const m17_stream_t *s, double t)
+{
+    if (!G.up && !G.down) {
+        return;
+    }
+    if (s_cfg.tot_s && (t - G.start) / 1000.0 > (double)s_cfg.tot_s) {
+        logf_("[W] relay time-out (%u s): the rest of this call is not relayed", s_cfg.tot_s);
+        gw_stop(" (time-out)");
+        return;
+    }
+    if (G.up) {
+        if (strcmp(R.call, "?") == 0) {
+            return;                           /* joined late: wait until the LICH gives the callsign */
+        }
+        if (s_st.link != ML_UP) {
+            gw_stop(" (reflector link lost)");
+            return;
+        }
+        gw_up_send(s->payload, s->type, s->last);
+        if (s->last) {
+            G.up = false;
+        }
+    }
+    if (G.down) {
+        radio_tx_frame(s_radio, G.down_fn, s->last, s->payload);
+        G.down_fn = (uint16_t)((G.down_fn + 1) & 0x7FFF);
+        G.down_packets++;
+        if (s->last) {
+            radio_tx_end(s_radio);
+            G.down = false;
+        }
+    }
+}
 
 static void play(int16_t *pcm, float *lv)
 {
@@ -209,6 +354,7 @@ static void rx_finish(const char *why)
         return;
     }
     R.active = false;
+    gw_stop(why);
     wav_close(&R.wav);
     unsigned under = 0;
     if (s_spk) {
@@ -236,8 +382,9 @@ static void rx_finish(const char *why)
     LeaveCriticalSection(&s_cs);
 }
 
-static void rx_start(const m17_stream_t *s, double t)
+static void rx_start(const m17_stream_t *s, double t, bool from_rf)
 {
+    R.from_rf = from_rf;
     snprintf(R.call, sizeof(R.call), "%s", s->src);
     snprintf(R.dest, sizeof(R.dest), "%s", s->dst);
     snprintf(R.type, sizeof(R.type), "%s", m17_type_name(s->type));
@@ -262,10 +409,11 @@ static void rx_start(const m17_stream_t *s, double t)
     s_st.rx_lost_pct = 0;
     s_st.rx_calls_total++;
     LeaveCriticalSection(&s_cs);
-    logf_("RX  %s  to %s  Codec 2 %s", R.call, R.dest, R.type);
+    logf_("RX  %s  to %s  Codec 2 %s%s", R.call, R.dest, R.type, s_cfg.gateway ? (from_rf ? "  [radio]" : "  [reflector]") : "");
+    gw_start(s, from_rf, t);
 }
 
-static void rx_stream(const m17_pkt_t *k, double t)
+static void rx_stream(const m17_pkt_t *k, double t, bool from_rf)
 {
     const m17_stream_t *s = &k->s;
     if (R.active && s->stream_id != R.sid) {
@@ -278,7 +426,7 @@ static void rx_stream(const m17_pkt_t *k, double t)
         if (s->last) {
             return;                               /* tail of a stream we did not hear */
         }
-        rx_start(s, t);
+        rx_start(s, t, from_rf);
     }
     R.last = t;
     if (!k->crc_ok) {
@@ -295,6 +443,7 @@ static void rx_stream(const m17_pkt_t *k, double t)
         }
     }
     R.next_fn = (uint16_t)((s->fn + 1) & 0x7FFF);
+    gw_packet(s, t);
 
     int16_t pcm[320];
     float lv = -99;
@@ -333,8 +482,13 @@ static void tx_send(bool last)
 {
     uint8_t pkt[M17_STREAM_LEN];
     T.s.last = last;
-    m17_build_stream(&T.s, pkt);
-    udp_send(pkt, sizeof(pkt));
+    if (s_radio) {
+        radio_tx_frame(s_radio, T.s.fn, last, T.s.payload);
+    }
+    if (s_use_net && s_st.link == ML_UP) {
+        m17_build_stream(&T.s, pkt);
+        udp_send(pkt, sizeof(pkt));
+    }
     T.s.fn = (uint16_t)((T.s.fn + 1) & 0x7FFF);
     T.n = 0;
     T.packets++;
@@ -349,16 +503,15 @@ static void tx_start(double t)
         rx_finish(" (cut by our transmission)");
     }
     memset(&T.s, 0, sizeof(T.s));
-    {   /* a new stream id each time (rand() would repeat: its state is per thread and not seeded here) */
-        LARGE_INTEGER q;
-        QueryPerformanceCounter(&q);
-        uint32_t h = (uint32_t)q.QuadPart * 2654435761u ^ (uint32_t)(q.QuadPart >> 32) ^ GetTickCount();
-        h ^= h >> 16;
-        T.s.stream_id = (uint16_t)(h % 0xFFFE + 1);
-    }
+    T.s.stream_id = new_stream_id();      /* rand() would repeat: its state is per thread and not seeded here */
     snprintf(T.s.src, sizeof(T.s.src), "%s", s_cfg.callsign);
     snprintf(T.s.dst, sizeof(T.s.dst), "%s", s_cfg.dest[0] ? s_cfg.dest : "@ALL");
     T.s.type = M17_TYPE_V3200;
+    if (s_radio) {
+        uint8_t lsf[M17_LSF_BYTES];
+        make_lsf(T.s.dst, T.s.src, T.s.type, lsf);
+        radio_tx_begin(s_radio, lsf);
+    }
     T.active = true;
     T.n = 0;
     T.packets = 0;
@@ -403,12 +556,153 @@ static void tx_finish(double t)
         T.n++;
     }
     tx_send(true);
+    if (s_radio) {
+        radio_tx_end(s_radio);
+    }
     T.active = false;
     wav_close(&T.mic);
     logf_("    end of transmission: %.1f s, %u packets", (t - T.start) / 1000.0, T.packets);
     EnterCriticalSection(&s_cs);
     s_st.tx = false;
     LeaveCriticalSection(&s_cs);
+}
+
+/* ---------------------------------------------------------------- radio mode: decoded RF frames -> the RX path */
+static uint16_t s_rad_sid = 1;
+static struct {
+    unsigned frames;
+    double evm_sum;
+    float evm_max;
+} RS;
+
+static struct {
+    unsigned frames, bad;                 /* relay + loopback: our own transmission heard back */
+    char src[M17_CALL_LEN];
+} SELF;
+
+static void radio_events(double t)
+{
+    radio_evt_t ev[16];
+    int n = radio_poll(s_radio, ev, 16);
+    for (int i = 0; i < n; ++i) {
+        const radio_evt_t *e = &ev[i];
+        /* our own transmission: in relay mode never relayed again (the loopback only counts it as a check) */
+        bool ours = s_use_net && (T.active || G.down || radio_keyed(s_radio));
+        if (ours) {
+            if (radio_full_duplex(s_radio)) {
+                if (e->kind == RE_LSF && e->have_lsf) {
+                    m17_decode_call(e->lsf + 6, SELF.src);
+                } else if (e->kind == RE_STREAM) {
+                    SELF.frames++;
+                    SELF.bad += e->s.lich_cnt < 0;
+                } else if (e->kind == RE_END) {
+                    logf_("    loopback check of our transmission: %u frames decoded, %u bad LICH, source %s",
+                          SELF.frames, SELF.bad, SELF.src[0] ? SELF.src : "?");
+                    memset(&SELF, 0, sizeof(SELF));
+                }
+            }
+            continue;
+        }
+        if (T.active && !radio_full_duplex(s_radio)) {
+            continue;
+        }
+        if (e->kind == RE_END) {
+            if (R.active) {
+                rx_finish(e->signal_lost ? " (signal lost)" : "");
+            }
+            if (RS.frames) {
+                logf_("    RF: %u frames, EVM avg %.3f max %.3f", RS.frames, RS.evm_sum / RS.frames, RS.evm_max);
+            }
+            memset(&RS, 0, sizeof(RS));
+            s_rad_sid++;
+            continue;
+        }
+        char src[M17_CALL_LEN] = "?", dst[M17_CALL_LEN] = "?";
+        uint16_t type = M17_TYPE_V3200;
+        if (e->have_lsf) {
+            m17_decode_call(e->lsf, dst);
+            m17_decode_call(e->lsf + 6, src);
+            type = (uint16_t)(e->lsf[12] << 8 | e->lsf[13]);
+        }
+        if (e->kind == RE_LSF) {
+            if (e->lsf_from_lich && R.active) {            /* joined late: now we know who it is */
+                snprintf(R.call, sizeof(R.call), "%s", src);
+                snprintf(R.dest, sizeof(R.dest), "%s", dst);
+                EnterCriticalSection(&s_cs);
+                snprintf(s_st.rx_call, sizeof(s_st.rx_call), "%s", src);
+                snprintf(s_st.rx_dest, sizeof(s_st.rx_dest), "%s", dst);
+                LeaveCriticalSection(&s_cs);
+                logf_("    callsign from the LICH: %s to %s", src, dst);
+            } else {
+                if (R.active) {
+                    rx_finish(" (new call)");
+                }
+                s_rad_sid++;
+                memset(&RS, 0, sizeof(RS));
+                logf_("RF  LSF %s to %s, level %.0f%s", src, dst, fabsf(e->gain),
+                      e->gain < 0 ? "  inverted (the other station may tick its invert option)" : "");
+            }
+            continue;
+        }
+        m17_pkt_t k;
+        memset(&k, 0, sizeof(k));
+        k.kind = MP_STREAM;
+        k.crc_ok = e->s.lich_cnt >= 0;
+        k.s.stream_id = s_rad_sid;
+        snprintf(k.s.src, sizeof(k.s.src), "%s", src);
+        snprintf(k.s.dst, sizeof(k.s.dst), "%s", dst);
+        k.s.type = type;
+        k.s.fn = e->s.fn;
+        k.s.last = e->s.last;
+        memcpy(k.s.payload, e->s.payload, 16);
+        RS.frames++;
+        RS.evm_sum += e->evm;
+        RS.evm_max = e->evm > RS.evm_max ? e->evm : RS.evm_max;
+        rx_stream(&k, t, true);
+        if (e->s.last) {
+            s_rad_sid++;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- loopback tests: another station on the radio */
+static void test_rf_call(void)
+{
+    int16_t *keep_pcm = s_wav_pcm;        /* load_wav fills the --tx-wav buffer: keep that one */
+    size_t keep_n = s_wav_n;
+    s_wav_pcm = NULL;
+    s_wav_n = 0;
+    bool ok = load_wav(s_cfg.test_rf_wav);
+    int16_t *pcm = s_wav_pcm;
+    size_t n = s_wav_n;
+    s_wav_pcm = keep_pcm;
+    s_wav_n = keep_n;
+    if (!ok) {
+        logf_("[E] cannot read %s", s_cfg.test_rf_wav);
+        return;
+    }
+    struct CODEC2 *c2 = codec2_create(CODEC2_MODE_3200);
+    uint8_t lsf[M17_LSF_BYTES];
+    const char *call = s_cfg.test_rf_call[0] ? s_cfg.test_rf_call : "JA0RF";
+    make_lsf("@ALL", call, M17_TYPE_V3200, lsf);
+    int8_t sym[M17_SYMS_PER_FRAME];
+    m17_rf_preamble(sym);
+    radio_loop_inject(s_radio, sym, M17_SYMS_PER_FRAME);
+    m17_rf_lsf_frame(lsf, sym);
+    radio_loop_inject(s_radio, sym, M17_SYMS_PER_FRAME);
+    size_t frames = n / 320;
+    for (size_t f = 0; f < frames; ++f) {
+        uint8_t pl[16];
+        codec2_encode(c2, pl, pcm + 320 * f);
+        codec2_encode(c2, pl + 8, pcm + 320 * f + 160);
+        m17_rf_stream_frame(lsf, (uint16_t)f, f + 1 == frames, pl, sym);
+        radio_loop_inject(s_radio, sym, M17_SYMS_PER_FRAME);
+    }
+    m17_rf_eot(sym);
+    radio_loop_inject(s_radio, sym, M17_SYMS_PER_FRAME);
+    codec2_destroy(c2);
+    free(pcm);
+    logf_("test: %s calls on the radio channel (%u frames)", call, (unsigned)frames);
 }
 
 /* ---------------------------------------------------------------- the thread */
@@ -418,7 +712,13 @@ static DWORD WINAPI run(LPVOID arg)
     timeBeginPeriod(1);
     memset(&R, 0, sizeof(R));
     memset(&T, 0, sizeof(T));
-    if (!open_socket()) {
+    s_use_net = !s_cfg.radio || s_cfg.gateway;
+    if (s_cfg.radio) {
+        s_radio = radio_open(&s_cfg.rc, logf_);
+    }
+    if ((s_cfg.radio && !s_radio) || (s_use_net && !open_socket())) {
+        radio_close(s_radio);
+        s_radio = NULL;
         set_link(ML_OFF);
         InterlockedExchange(&s_running, 0);
         timeEndPeriod(1);
@@ -437,14 +737,35 @@ static DWORD WINAPI run(LPVOID arg)
     }
 
     uint8_t pkt[256];
-    double t_conn = -1e9, t_rx = now_ms();
-    me_link_t link = ML_CONNECTING;
+    double t_conn = -1e9, t_rx = now_ms(), t_begin = now_ms();
+    bool test_rf_done = !s_radio || !s_cfg.test_rf_wav[0] || !radio_full_duplex(s_radio);
+    me_link_t link = s_use_net ? ML_CONNECTING : ML_UP;
     set_link(link);
+    EnterCriticalSection(&s_cs);
+    s_st.radio_up = s_radio != NULL;
+    if (s_radio && !s_use_net) {
+        snprintf(s_st.reflector, sizeof(s_st.reflector), "RADIO");
+    }
+    LeaveCriticalSection(&s_cs);
+    if (s_radio && !s_use_net) {
+        logf_("radio mode: callsign %s, destination %s", s_cfg.callsign, s_cfg.dest[0] ? s_cfg.dest : "@ALL");
+    } else if (s_radio) {
+        logf_("relay mode: radio -> reflector %s, reflector -> radio %s%s", s_cfg.gw_rf_to_net ? "on" : "off",
+              s_cfg.gw_net_to_rf ? "on" : "off",
+              s_cfg.gw_net_to_rf ? (s_cfg.gw_keep_src ? " (caller's callsign)" : " (our callsign)") : "");
+    }
     unsigned tries = 0;
 
     while (!s_stop) {
         double t = now_ms();
-        if ((link == ML_CONNECTING && t - t_conn > CONN_RETRY_MS) || (link == ML_REFUSED && t - t_conn > REFUSED_RETRY_MS)) {
+        if (s_radio) {
+            if (!test_rf_done && t - t_begin > s_cfg.test_rf_at * 1000.0) {
+                test_rf_call();
+                test_rf_done = true;
+            }
+            radio_events(t);
+        }
+        if (s_use_net && ((link == ML_CONNECTING && t - t_conn > CONN_RETRY_MS) || (link == ML_REFUSED && t - t_conn > REFUSED_RETRY_MS))) {
             udp_send(pkt, m17_conn(s_cfg.callsign, s_cfg.module, pkt));
             logf_("connecting ...");
             if (++tries == 3) {
@@ -453,14 +774,14 @@ static DWORD WINAPI run(LPVOID arg)
             }
             t_conn = t;
         }
-        if (link == ML_UP && t - t_rx > LINK_TIMEOUT_MS) {
+        if (s_use_net && link == ML_UP && t - t_rx > LINK_TIMEOUT_MS) {
             logf_("[W] nothing from the reflector for 30 s: connecting again");
             link = ML_CONNECTING;
             set_link(link);
             tries = 0;
             t_conn = -1e9;
         }
-        for (;;) {
+        for (; s_use_net;) {
             struct sockaddr_in from;
             int fl = sizeof(from);
             int n = recvfrom(s_sock, (char *)pkt, sizeof(pkt), 0, (struct sockaddr *)&from, &fl);
@@ -517,7 +838,7 @@ static DWORD WINAPI run(LPVOID arg)
                 break;
             case MP_STREAM:
                 if (!T.active && link == ML_UP) {
-                    rx_stream(&k, t);
+                    rx_stream(&k, t, false);
                 }
                 break;
             default:
@@ -578,10 +899,21 @@ static DWORD WINAPI run(LPVOID arg)
 
     tx_finish(now_ms());
     rx_finish("");
-    udp_send(pkt, m17_disc(s_cfg.callsign, pkt));
-    logf_("unlinked");
-    closesocket(s_sock);
-    s_sock = INVALID_SOCKET;
+    if (s_radio) {
+        for (int i = 0; i < 3000 && radio_keyed(s_radio); ++i) {   /* let the end of the transmission play */
+            radio_events(now_ms());
+            Sleep(1);
+        }
+        radio_close(s_radio);
+        s_radio = NULL;
+        logf_("radio closed");
+    }
+    if (s_use_net) {
+        udp_send(pkt, m17_disc(s_cfg.callsign, pkt));
+        logf_("unlinked");
+        closesocket(s_sock);
+        s_sock = INVALID_SOCKET;
+    }
     if (s_spk) {
         Sleep(audio_queued_ms(s_spk) > 2000 ? 2000 : audio_queued_ms(s_spk));
         audio_close(s_spk);
@@ -608,6 +940,14 @@ static bool init_once(void)
         s_c3200_rx = codec2_create(CODEC2_MODE_3200);
         s_c1600_rx = codec2_create(CODEC2_MODE_1600);
         ok = s_c3200_tx && s_c3200_rx && s_c1600_rx;
+        if (ok) {
+            struct CODEC2 *c = codec2_create(CODEC2_MODE_3200);
+            short z[160] = { 0 };
+            for (int i = 0; i < 4; ++i) {
+                codec2_encode(c, s_sil3200, z);
+            }
+            codec2_destroy(c);
+        }
         done = true;
     }
     return ok;
