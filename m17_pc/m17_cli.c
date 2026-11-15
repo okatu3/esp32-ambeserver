@@ -17,7 +17,10 @@
  *   m17_cli HOST CALLSIGN --relay [radio options]    (relay: the radio and a reflector at the same time)
  *     radio -> reflector is on (--no-relay-to-net turns it off); --relay-to-radio also transmits the reflector's
  *     calls on the radio, with our callsign as source (--relay-keep-src: the caller's).
- *     --test-rf WAV:CALL:S  with --loop: CALL calls on the radio channel S seconds after the start (tests)
+ *     HOST "-": start unlinked. Calls heard on the radio to "M17-XXX A" link (name looked up in --hosts FILE,
+ *     default hosts\M17Hosts.txt next to the program), "UNLINK", "ECHO", "INFO"; --no-commands, --no-answers
+ *     --test-rf WAV:CALL:S[:DEST]  with --loop: CALL calls DEST on the radio channel S s after the start (tests,
+ *                        up to 6 times)
  *   m17_cli -l           list microphones and speakers
  * A transmission is started here only by --tx-wav: this program has no PTT key. */
 #define WIN32_LEAN_AND_MEAN
@@ -87,7 +90,8 @@ int main(int argc, char **argv)
                         "       [--civ-addr A4] [--civ-baud 115200] [--tx-level dBFS] [--tx-delay MS] [--tx-invert]\n"
                         "       [--loop [--loop-snr dB] [--loop-voice-band]]   (a radio on the sound card; --loop: tests)\n"
                         "   or: m17_cli HOST CALLSIGN --relay [radio options] [--relay-to-radio] [--relay-keep-src]\n"
-                        "       [--no-relay-to-net] [--test-rf WAV:CALL:SECONDS]   (relay between a radio and a reflector)\n"
+                        "       [--no-relay-to-net] [--hosts FILE] [--no-commands] [--no-answers]\n"
+                        "       [--test-rf WAV:CALL:SECONDS[:DEST]]   (relay between a radio and a reflector; HOST - = none)\n"
                         "   or: m17_cli -l\n");
         return 2;
     }
@@ -131,19 +135,25 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--relay-to-radio")) { c.gw_net_to_rf = true; }
         else if (!strcmp(a, "--no-relay-to-net")) { c.gw_rf_to_net = false; }
         else if (!strcmp(a, "--relay-keep-src")) { c.gw_keep_src = true; }
-        else if (!strcmp(a, "--test-rf")) {                 /* WAV[:CALL[:SECONDS]] */
-            char w[260] = "", call[16] = "", at[16] = "";
+        else if (!strcmp(a, "--hosts")) { snprintf(c.hosts_file, sizeof(c.hosts_file), "%s", v); ++i; }
+        else if (!strcmp(a, "--no-commands")) { c.gw_commands = false; }
+        else if (!strcmp(a, "--no-answers")) { c.gw_replies = false; }
+        else if (!strcmp(a, "--test-rf") && c.test_rf_n < 6) {   /* WAV[:CALL[:SECONDS[:DEST]]] */
+            char w[260] = "", call[16] = "", at[16] = "", dst[16] = "";
             snprintf(w, sizeof(w), "%s", v);
             /* the WAV path may hold a drive letter: split only on colons after it */
             char *q = strchr(w + (w[1] == ':' ? 2 : 0), ':');
             if (q) {
                 *q++ = 0;
-                sscanf(q, "%15[^:]:%15s", call, at);
+                sscanf(q, "%15[^:]:%15[^:]:%15[^\n]", call, at, dst);
             }
-            snprintf(c.test_rf_wav, sizeof(c.test_rf_wav), "%s", w);
-            snprintf(c.test_rf_call, sizeof(c.test_rf_call), "%s", call);
-            upper(c.test_rf_call);
-            c.test_rf_at = at[0] ? (float)atof(at) : 2.0f;
+            int k = c.test_rf_n++;
+            snprintf(c.test_rf[k].wav, sizeof(c.test_rf[k].wav), "%s", w);
+            snprintf(c.test_rf[k].call, sizeof(c.test_rf[k].call), "%s", call);
+            snprintf(c.test_rf[k].dst, sizeof(c.test_rf[k].dst), "%s", dst);
+            upper(c.test_rf[k].call);
+            upper(c.test_rf[k].dst);
+            c.test_rf[k].at = at[0] ? (float)atof(at) : 2.0f;
             ++i;
         }
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
@@ -153,6 +163,18 @@ int main(int argc, char **argv)
     if (!strcmp(c.host, "radio")) {
         c.radio = true;
         c.gateway = false;
+    }
+    if (!strcmp(c.host, "-")) {                        /* relay without a reflector: link from the radio */
+        c.host[0] = 0;
+    }
+    if (!c.hosts_file[0]) {                            /* hosts\M17Hosts.txt next to the program */
+        char exe[220];
+        GetModuleFileNameA(NULL, exe, sizeof(exe));
+        char *s = strrchr(exe, '\\');
+        if (s) {
+            *s = 0;
+        }
+        snprintf(c.hosts_file, sizeof(c.hosts_file), "%s\\hosts\\M17Hosts.txt", exe);
     }
     bool parrot = !strcmp(c.host, "parrot");
     if (parrot) {

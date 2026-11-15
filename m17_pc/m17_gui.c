@@ -514,7 +514,7 @@ static void wput_int(const wchar_t *key, int v)
     WritePrivateProfileStringW(L"radio", key, w, s_ini);
 }
 
-enum { RD_IN = 300, RD_OUT, RD_PTT, RD_PORT, RD_ADDR, RD_BAUD, RD_LEVEL, RD_DELAY, RD_INV, RD_N2R, RD_KEEP };
+enum { RD_IN = 300, RD_OUT, RD_PTT, RD_PORT, RD_ADDR, RD_BAUD, RD_LEVEL, RD_DELAY, RD_INV, RD_N2R, RD_KEEP, RD_CMD };
 static struct {
     HWND wnd;
     bool done, ok;
@@ -582,7 +582,7 @@ static void radio_settings(void)
     }
     radio_cfg_t c;
     radio_cfg_from_ini(&c);
-    RECT pr, r = { 0, 0, S(520), S(470) };
+    RECT pr, r = { 0, 0, S(520), S(500) };
     GetWindowRect(s_wnd, &pr);
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
@@ -642,6 +642,10 @@ static void radio_settings(void)
     HWND keep = rd_add(L"BUTTON", L"そのとき送信元を相手のコールサインのままにする（既定は自局のコールサイン）",
                        BS_AUTOCHECKBOX | WS_TABSTOP, 30, y, 478, 24, RD_KEEP);
     SendMessageW(keep, BM_SETCHECK, rini(L"relay_keep_src", 0) ? BST_CHECKED : 0, 0);
+    y += 26;
+    HWND cmd = rd_add(L"BUTTON", L"無線機からの操作を受け付け、返事を送信する（宛先 M17-XXX A・UNLINK・ECHO・INFO）",
+                      BS_AUTOCHECKBOX | WS_TABSTOP, 12, y, 496, 24, RD_CMD);
+    SendMessageW(cmd, BM_SETCHECK, rini(L"relay_commands", 1) ? BST_CHECKED : 0, 0);
     y += 34;
     rd_add(L"STATIC",
            L"マイク端子・スピーカー端子では通りません（300 Hz〜3 kHz の帯域では復調できないことを試験で確認）。"
@@ -678,6 +682,7 @@ static void radio_settings(void)
         wput_int(L"tx_invert", SendMessageW(inv, BM_GETCHECK, 0, 0) == BST_CHECKED);
         wput_int(L"relay_to_radio", SendMessageW(n2r, BM_GETCHECK, 0, 0) == BST_CHECKED);
         wput_int(L"relay_keep_src", SendMessageW(keep, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        wput_int(L"relay_commands", SendMessageW(cmd, BM_GETCHECK, 0, 0) == BST_CHECKED);
         append_logw(L"無線機の設定を保存しました");
     }
     EnableWindow(s_wnd, TRUE);
@@ -842,18 +847,31 @@ static void do_connect(void)
         c.gw_net_to_rf = rini(L"relay_to_radio", 0) != 0;
         c.gw_keep_src = rini(L"relay_keep_src", 0) != 0;
         c.gw_cushion_ms = (unsigned)rini(L"relay_cushion_ms", 200);
+        c.gw_commands = c.gw_replies = rini(L"relay_commands", 1) != 0;
+        {
+            wchar_t hp[MAX_PATH];
+            hosts_path(hp);
+            WideCharToMultiByte(CP_ACP, 0, hp, -1, c.hosts_file, sizeof(c.hosts_file), NULL, NULL);
+        }
         if (!c.gateway) {
             snprintf(c.host, sizeof(c.host), "radio");
         }
-        if (c.gateway && c.gw_net_to_rf && c.rc.in_device != RADIO_DEV_LOOP && c.rc.out_device != RADIO_DEV_LOOP) {
-            int a = MessageBoxW(s_wnd,
-                                L"中継モードで「リフレクターの通話を無線機から送信する」が入っています。\n"
-                                L"リフレクターに誰かが話すたびに、あなたの無線機から自動で電波が出ます。\n\n"
-                                L"・ほかの人の通話を自局の電波で送ることが、あなたの免許・運用の条件で認められているか確かめてください。\n"
-                                L"・無人で動かさず、そばで監視してください。\n"
-                                L"・調整のうちはダミーロードで。\n\n"
-                                L"この設定で接続しますか？",
-                                L"m17_pc  中継の確認", MB_OKCANCEL | MB_ICONWARNING);
+        if (c.gateway && (c.gw_net_to_rf || c.gw_replies) && c.rc.in_device != RADIO_DEV_LOOP &&
+            c.rc.out_device != RADIO_DEV_LOOP) {
+            const wchar_t *msg =
+                c.gw_net_to_rf
+                    ? L"中継モードで「リフレクターの通話を無線機から送信する」が入っています。\n"
+                      L"リフレクターに誰かが話すたびに、あなたの無線機から自動で電波が出ます。\n\n"
+                      L"・ほかの人の通話を自局の電波で送ることが、あなたの免許・運用の条件で認められているか確かめてください。\n"
+                      L"・無人で動かさず、そばで監視してください。\n"
+                      L"・調整のうちはダミーロードで。\n\n"
+                      L"この設定で接続しますか？"
+                    : L"中継モードで「無線機からの操作」が入っています。\n"
+                      L"無線機から操作（宛先 M17-XXX A・UNLINK・ECHO・INFO）を受けると、返事として自動で短く電波が出ます。\n\n"
+                      L"・無人で動かさず、そばで監視してください。\n"
+                      L"・調整のうちはダミーロードで。\n\n"
+                      L"この設定で接続しますか？";
+            int a = MessageBoxW(s_wnd, msg, L"m17_pc  中継の確認", MB_OKCANCEL | MB_ICONWARNING);
             if (a != IDOK) {
                 return;
             }
@@ -996,6 +1014,8 @@ static void update_status(void)
         } else {
             wcscpy(t, L"接続中（待受）");
         }
+    } else if (st.link == ML_OFF && st.radio_up) {
+        wcscpy(t, L"中継  リフレクター未接続");
     } else if (st.link == ML_REFUSED) {
         wcscpy(t, L"接続を断られました");
     } else {

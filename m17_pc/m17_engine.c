@@ -89,6 +89,7 @@ void me_default_cfg(me_cfg_t *c)
     radio_default_cfg(&c->rc);
     c->gw_rf_to_net = true;
     c->gw_cushion_ms = 200;
+    c->gw_commands = c->gw_replies = true;
 }
 
 static void set_link(me_link_t l)
@@ -155,20 +156,28 @@ static void udp_send(const uint8_t *p, size_t n)
     sendto(s_sock, (const char *)p, (int)n, 0, (struct sockaddr *)&s_to, sizeof(s_to));
 }
 
-static bool open_socket(void)
+static bool resolve_to(const char *host, uint16_t port_no)
 {
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     char port[8];
-    snprintf(port, sizeof(port), "%u", s_cfg.port ? s_cfg.port : M17_PORT);
-    if (getaddrinfo(s_cfg.host, port, &hints, &res) != 0 || !res) {
-        logf_("[E] cannot resolve %s", s_cfg.host);
+    snprintf(port, sizeof(port), "%u", port_no ? port_no : M17_PORT);
+    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) {
+        logf_("[E] cannot resolve %s", host);
         return false;
     }
     memcpy(&s_to, res->ai_addr, sizeof(s_to));
     freeaddrinfo(res);
+    return true;
+}
+
+static bool open_socket(void)
+{
+    if (s_cfg.host[0] && !resolve_to(s_cfg.host, s_cfg.port)) {
+        return false;
+    }
     s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s_sock == INVALID_SOCKET) {
         logf_("[E] no UDP socket");
@@ -176,6 +185,10 @@ static bool open_socket(void)
     }
     u_long nb = 1;
     ioctlsocket(s_sock, FIONBIO, &nb);
+    if (!s_cfg.host[0]) {
+        logf_("no reflector yet: link from the radio with the destination \"M17-XXX A\"");
+        return true;
+    }
     char ip[32];
     inet_ntop(AF_INET, &s_to.sin_addr, ip, sizeof(ip));
     logf_("reflector %s = %s:%u, module %c, callsign %s", s_cfg.host, ip, ntohs(s_to.sin_port), s_cfg.module,
@@ -208,7 +221,125 @@ static struct {
     unsigned down_packets;
     double start;
     unsigned under0;                      /* radio output underruns when the call started */
+    int cmd;                              /* GC_*: this call is a command, not relayed */
+    char cmd_refl[M17_CALL_LEN], cmd_mod;
 } G;
+
+/* ---------------------------------------------------------------- relay commands from the radio */
+static void make_lsf(const char *dst, const char *src, uint16_t type, uint8_t lsf[M17_LSF_BYTES]);
+enum { GC_NONE, GC_LINK, GC_UNLINK, GC_ECHO, GC_INFO };
+
+static struct {
+    int cmd;                              /* waiting to be carried out by the thread's loop */
+    char refl[M17_CALL_LEN], mod, caller[M17_CALL_LEN];
+    bool await;                           /* a commanded link waits for ACKN */
+    double await_t;
+    char name[M17_CALL_LEN];              /* the reflector we were told to link to, e.g. "M17-USA" */
+    /* the answer: a short transmission */
+    bool reply;
+    double reply_at;
+    char reply_dst[M17_CALL_LEN];
+    uint8_t (*pl)[16];                    /* payloads (echo, or beeps) */
+    int n, cap;
+    uint16_t type;
+    /* echo recording */
+    int echo_n;
+} C;
+
+static int parse_cmd(const char *d, char *refl, char *mod)
+{
+    if (!_stricmp(d, "UNLINK") || !_stricmp(d, "U")) {
+        return GC_UNLINK;
+    }
+    if (!_stricmp(d, "ECHO") || !_stricmp(d, "E")) {
+        return GC_ECHO;
+    }
+    if (!_stricmp(d, "INFO") || !_stricmp(d, "I")) {
+        return GC_INFO;
+    }
+    size_t n = strlen(d);
+    if (n >= 7 && !_strnicmp(d, "M17-", 4) && (n == 7 || (n == 9 && d[7] == ' ' && d[8] >= 'A' && d[8] <= 'Z'))) {
+        memcpy(refl, d, 7);
+        refl[7] = 0;
+        *mod = n == 9 ? d[8] : 'A';
+        return GC_LINK;
+    }
+    return GC_NONE;
+}
+
+/* hosts file: "NAME HOST [PORT]  # comment" */
+static bool hosts_lookup(const char *name, char *host, size_t hs, uint16_t *port)
+{
+    FILE *f = s_cfg.hosts_file[0] ? fopen(s_cfg.hosts_file, "r") : NULL;
+    if (!f) {
+        return false;
+    }
+    char line[512];
+    bool ok = false;
+    while (!ok && fgets(line, sizeof(line), f)) {
+        char *h = strchr(line, '#');
+        if (h) {
+            *h = 0;
+        }
+        char nm[64], ho[128];
+        unsigned p = 0;
+        if (sscanf(line, "%63s %127s %u", nm, ho, &p) >= 2 && !_stricmp(nm, name)) {
+            snprintf(host, hs, "%s", ho);
+            *port = (uint16_t)(p ? p : M17_PORT);
+            ok = true;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+static struct CODEC2 *s_c3200_beep;
+
+static void reply_reserve(int n)
+{
+    if (n > C.cap) {
+        C.pl = realloc(C.pl, sizeof(*C.pl) * (size_t)n);
+        C.cap = n;
+    }
+}
+
+/* the answer to a command: beeps (count, pitch) with the result in the destination field */
+static void reply_beeps(const char *dst, int count, float hz, double at)
+{
+    snprintf(C.reply_dst, sizeof(C.reply_dst), "%s", dst);
+    static int16_t pcm[8000];             /* 1 s */
+    memset(pcm, 0, sizeof(pcm));
+    int on = count == 1 ? 2400 : 960, gap = 800;
+    for (int b = 0; b < count; ++b) {
+        int s0 = 800 + b * (on + gap);
+        for (int i = 0; i < on && s0 + i < 8000; ++i) {
+            float env = i < 80 ? i / 80.0f : (on - i < 80 ? (on - i) / 80.0f : 1.0f);
+            pcm[s0 + i] = (int16_t)(9000.0f * env * sinf(2.0f * (float)M_PI * hz * (float)i / 8000.0f));
+        }
+    }
+    reply_reserve(25);
+    for (int f = 0; f < 25; ++f) {
+        codec2_encode(s_c3200_beep, C.pl[f], pcm + 320 * f);
+        codec2_encode(s_c3200_beep, C.pl[f] + 8, pcm + 320 * f + 160);
+    }
+    C.n = 25;
+    C.type = M17_TYPE_V3200;
+    C.reply = true;
+    C.reply_at = at;
+}
+
+static void reply_send_now(void)
+{
+    uint8_t lsf[M17_LSF_BYTES];
+    make_lsf(C.reply_dst, s_cfg.callsign, C.type, lsf);
+    radio_tx_begin(s_radio, lsf);
+    for (int f = 0; f < C.n; ++f) {
+        radio_tx_frame(s_radio, (uint16_t)f, f + 1 == C.n, C.pl[f]);
+    }
+    radio_tx_end(s_radio);
+    logf_("    answer on the radio: to \"%s\", %.1f s", C.reply_dst, C.n * 0.04);
+    C.reply = false;
+}
 
 static uint16_t new_stream_id(void)
 {
@@ -260,6 +391,18 @@ static void gw_start(const m17_stream_t *s, bool from_rf, double t)
     }
     G.start = t;
     G.under0 = radio_stats(s_radio)->tx_underruns;
+    if (from_rf && s_cfg.gw_commands) {
+        G.cmd = parse_cmd(s->dst, G.cmd_refl, &G.cmd_mod);
+        if (G.cmd != GC_NONE) {
+            static const char *names[] = { "", "link", "unlink", "echo", "info" };
+            logf_("    command from %s: %s%s%s%s%c", s->src, names[G.cmd], G.cmd == GC_LINK ? " " : "",
+                  G.cmd == GC_LINK ? G.cmd_refl : "", G.cmd == GC_LINK ? " " : "", G.cmd == GC_LINK ? G.cmd_mod : ' ');
+            if (G.cmd == GC_ECHO) {
+                C.echo_n = 0;
+            }
+            return;                           /* a command is not relayed */
+        }
+    }
     if (from_rf && s_cfg.gw_rf_to_net && s_st.link == ML_UP) {
         G.up = true;
         G.up_sid = new_stream_id();
@@ -276,6 +419,14 @@ static void gw_start(const m17_stream_t *s, bool from_rf, double t)
 /* the call ends (last packet, end of signal, time-out or cut): close what was relayed */
 static void gw_stop(const char *why)
 {
+    if (G.cmd != GC_NONE) {
+        C.cmd = G.cmd;
+        snprintf(C.refl, sizeof(C.refl), "%s", G.cmd_refl);
+        C.mod = G.cmd_mod;
+        snprintf(C.caller, sizeof(C.caller), "%s", R.call);
+        G.cmd = GC_NONE;
+        return;
+    }
     static const uint8_t zero[16];
     uint8_t sil[16];
     memcpy(sil, s_sil3200, 8);
@@ -304,6 +455,14 @@ static void gw_stop(const char *why)
 /* one packet of the call being heard */
 static void gw_packet(const m17_stream_t *s, double t)
 {
+    if (G.cmd == GC_ECHO) {
+        if (C.echo_n < 1500) {                /* up to 60 s */
+            reply_reserve(C.echo_n + 1);
+            memcpy(C.pl[C.echo_n++], s->payload, 16);
+            C.type = s->type;
+        }
+        return;
+    }
     if (!G.up && !G.down) {
         return;
     }
@@ -595,7 +754,7 @@ static void radio_events(double t)
                 } else if (e->kind == RE_STREAM) {
                     SELF.frames++;
                     SELF.bad += e->s.lich_cnt < 0;
-                } else if (e->kind == RE_END) {
+                } else if (e->kind == RE_END && SELF.frames) {
                     logf_("    loopback check of our transmission: %u frames decoded, %u bad LICH, source %s",
                           SELF.frames, SELF.bad, SELF.src[0] ? SELF.src : "?");
                     memset(&SELF, 0, sizeof(SELF));
@@ -633,6 +792,14 @@ static void radio_events(double t)
                 snprintf(s_st.rx_dest, sizeof(s_st.rx_dest), "%s", dst);
                 LeaveCriticalSection(&s_cs);
                 logf_("    callsign from the LICH: %s to %s", src, dst);
+                if (R.from_rf && s_cfg.gateway && s_cfg.gw_commands && G.cmd == GC_NONE) {
+                    G.cmd = parse_cmd(dst, G.cmd_refl, &G.cmd_mod);   /* a command heard late is still a command */
+                    if (G.cmd != GC_NONE) {
+                        G.up = false;                 /* nothing was relayed yet: the callsign was unknown */
+                        C.echo_n = 0;
+                        logf_("    command from %s (joined late): %s", src, dst);
+                    }
+                }
             } else {
                 if (R.active) {
                     rx_finish(" (new call)");
@@ -665,26 +832,130 @@ static void radio_events(double t)
     }
 }
 
+/* carries out a command heard on the radio, follows a commanded link, sends the answer when the channel is free */
+static void gw_service(double t, me_link_t *link, double *t_conn, unsigned *tries)
+{
+    uint8_t pkt[16];
+    if (C.cmd == GC_LINK) {
+        char host[128];
+        uint16_t port = 0;
+        if (!hosts_lookup(C.refl, host, sizeof(host), &port)) {
+            logf_("[W] %s is not in the reflector list (%s)", C.refl, s_cfg.hosts_file);
+            reply_beeps("NOT FOUND", 3, 440.0f, t + 800);
+        } else if (*link == ML_UP && !_stricmp(C.name, C.refl) && s_cfg.module == C.mod) {
+            char d[M17_CALL_LEN];
+            snprintf(d, sizeof(d), "%.7s %c", C.refl, C.mod);
+            logf_("    already linked to %s", d);
+            reply_beeps(d, 2, 880.0f, t + 800);
+        } else {
+            if (*link != ML_OFF && s_cfg.host[0]) {
+                udp_send(pkt, m17_disc(s_cfg.callsign, pkt));
+            }
+            if (resolve_to(host, port)) {
+                snprintf(s_cfg.host, sizeof(s_cfg.host), "%s", host);
+                s_cfg.port = port;
+                s_cfg.module = C.mod;
+                snprintf(C.name, sizeof(C.name), "%s", C.refl);
+                *link = ML_CONNECTING;
+                *t_conn = -1e9;
+                *tries = 0;
+                C.await = true;
+                C.await_t = t;
+                EnterCriticalSection(&s_cs);
+                s_st.reflector[0] = 0;
+                LeaveCriticalSection(&s_cs);
+                set_link(*link);
+                logf_("linking to %s module %c (%s:%u), asked by %s", C.refl, C.mod, host, port, C.caller);
+            } else {
+                *link = ML_OFF;
+                set_link(*link);
+                reply_beeps("LINK FAIL", 3, 440.0f, t + 800);
+            }
+        }
+    } else if (C.cmd == GC_UNLINK) {
+        if (*link != ML_OFF && s_cfg.host[0]) {
+            udp_send(pkt, m17_disc(s_cfg.callsign, pkt));
+        }
+        *link = ML_OFF;
+        set_link(*link);
+        C.await = false;
+        C.name[0] = 0;
+        EnterCriticalSection(&s_cs);
+        s_st.reflector[0] = 0;
+        LeaveCriticalSection(&s_cs);
+        logf_("unlinked, asked by %s", C.caller);
+        reply_beeps("UNLINKED", 1, 660.0f, t + 800);
+    } else if (C.cmd == GC_INFO) {
+        if (*link == ML_UP) {
+            char d[M17_CALL_LEN];
+            snprintf(d, sizeof(d), "%.7s %c", C.name[0] ? C.name : (s_st.reflector[0] ? s_st.reflector : "M17-???"),
+                     s_cfg.module);
+            reply_beeps(d, 2, 880.0f, t + 800);
+        } else {
+            reply_beeps("UNLINKED", 1, 660.0f, t + 800);
+        }
+    } else if (C.cmd == GC_ECHO) {
+        if (C.echo_n) {
+            snprintf(C.reply_dst, sizeof(C.reply_dst), "ECHO");
+            C.n = C.echo_n;
+            C.reply = true;
+            C.reply_at = t + 1000;
+            logf_("    echo: %.1f s recorded, playing it back in 1 s", C.echo_n * 0.04);
+        }
+    }
+    C.cmd = GC_NONE;
+
+    if (C.await) {
+        if (*link == ML_UP) {
+            char d[M17_CALL_LEN];
+            snprintf(d, sizeof(d), "%.7s %c", C.name, s_cfg.module);
+            reply_beeps(d, 2, 880.0f, t + 300);
+            C.await = false;
+        } else if (*link == ML_REFUSED || t - C.await_t > 15000) {
+            logf_("[W] could not link to %s module %c (%s)", C.name, s_cfg.module,
+                  *link == ML_REFUSED ? "refused" : "no answer");
+            if (s_cfg.host[0]) {
+                udp_send(pkt, m17_disc(s_cfg.callsign, pkt));
+            }
+            *link = ML_OFF;
+            set_link(*link);
+            C.await = false;
+            C.name[0] = 0;
+            reply_beeps("LINK FAIL", 3, 440.0f, t + 300);
+        }
+    }
+
+    if (C.reply && t >= C.reply_at && !R.active && !T.active && !radio_keyed(s_radio)) {
+        if (s_cfg.gw_replies) {
+            reply_send_now();
+        } else {
+            logf_("    (answer \"%s\" not transmitted: answers are off)", C.reply_dst);
+            C.reply = false;
+        }
+    }
+}
+
 /* ---------------------------------------------------------------- loopback tests: another station on the radio */
-static void test_rf_call(void)
+static void test_rf_call(int k)
 {
     int16_t *keep_pcm = s_wav_pcm;        /* load_wav fills the --tx-wav buffer: keep that one */
     size_t keep_n = s_wav_n;
     s_wav_pcm = NULL;
     s_wav_n = 0;
-    bool ok = load_wav(s_cfg.test_rf_wav);
+    bool ok = load_wav(s_cfg.test_rf[k].wav);
     int16_t *pcm = s_wav_pcm;
     size_t n = s_wav_n;
     s_wav_pcm = keep_pcm;
     s_wav_n = keep_n;
     if (!ok) {
-        logf_("[E] cannot read %s", s_cfg.test_rf_wav);
+        logf_("[E] cannot read %s", s_cfg.test_rf[k].wav);
         return;
     }
     struct CODEC2 *c2 = codec2_create(CODEC2_MODE_3200);
     uint8_t lsf[M17_LSF_BYTES];
-    const char *call = s_cfg.test_rf_call[0] ? s_cfg.test_rf_call : "JA0RF";
-    make_lsf("@ALL", call, M17_TYPE_V3200, lsf);
+    const char *call = s_cfg.test_rf[k].call[0] ? s_cfg.test_rf[k].call : "JA0RF";
+    const char *dst = s_cfg.test_rf[k].dst[0] ? s_cfg.test_rf[k].dst : "@ALL";
+    make_lsf(dst, call, M17_TYPE_V3200, lsf);
     int8_t sym[M17_SYMS_PER_FRAME];
     m17_rf_preamble(sym);
     radio_loop_inject(s_radio, sym, M17_SYMS_PER_FRAME);
@@ -702,7 +973,7 @@ static void test_rf_call(void)
     radio_loop_inject(s_radio, sym, M17_SYMS_PER_FRAME);
     codec2_destroy(c2);
     free(pcm);
-    logf_("test: %s calls on the radio channel (%u frames)", call, (unsigned)frames);
+    logf_("test: %s calls \"%s\" on the radio channel (%u frames)", call, dst, (unsigned)frames);
 }
 
 /* ---------------------------------------------------------------- the thread */
@@ -738,8 +1009,8 @@ static DWORD WINAPI run(LPVOID arg)
 
     uint8_t pkt[256];
     double t_conn = -1e9, t_rx = now_ms(), t_begin = now_ms();
-    bool test_rf_done = !s_radio || !s_cfg.test_rf_wav[0] || !radio_full_duplex(s_radio);
-    me_link_t link = s_use_net ? ML_CONNECTING : ML_UP;
+    int test_rf_next = s_radio && radio_full_duplex(s_radio) ? 0 : s_cfg.test_rf_n;
+    me_link_t link = s_use_net ? (s_cfg.host[0] ? ML_CONNECTING : ML_OFF) : ML_UP;
     set_link(link);
     EnterCriticalSection(&s_cs);
     s_st.radio_up = s_radio != NULL;
@@ -759,11 +1030,13 @@ static DWORD WINAPI run(LPVOID arg)
     while (!s_stop) {
         double t = now_ms();
         if (s_radio) {
-            if (!test_rf_done && t - t_begin > s_cfg.test_rf_at * 1000.0) {
-                test_rf_call();
-                test_rf_done = true;
+            if (test_rf_next < s_cfg.test_rf_n && t - t_begin > s_cfg.test_rf[test_rf_next].at * 1000.0) {
+                test_rf_call(test_rf_next++);
             }
             radio_events(t);
+            if (s_use_net && s_cfg.gateway) {
+                gw_service(t, &link, &t_conn, &tries);
+            }
         }
         if (s_use_net && ((link == ML_CONNECTING && t - t_conn > CONN_RETRY_MS) || (link == ML_REFUSED && t - t_conn > REFUSED_RETRY_MS))) {
             udp_send(pkt, m17_conn(s_cfg.callsign, s_cfg.module, pkt));
@@ -852,7 +1125,7 @@ static DWORD WINAPI run(LPVOID arg)
         /* ---- PTT and transmitting */
         bool want = s_ptt != 0;
         if (want && !T.active) {
-            if ((!mic && !s_wav_pcm) || link != ML_UP) {
+            if ((!mic && !s_wav_pcm) || (link != ML_UP && !s_radio)) {
                 InterlockedExchange(&s_ptt, 0);
                 want = false;
             } else {
@@ -909,7 +1182,9 @@ static DWORD WINAPI run(LPVOID arg)
         logf_("radio closed");
     }
     if (s_use_net) {
-        udp_send(pkt, m17_disc(s_cfg.callsign, pkt));
+        if (s_cfg.host[0] && link != ML_OFF) {
+            udp_send(pkt, m17_disc(s_cfg.callsign, pkt));
+        }
         logf_("unlinked");
         closesocket(s_sock);
         s_sock = INVALID_SOCKET;
@@ -940,6 +1215,7 @@ static bool init_once(void)
         s_c3200_rx = codec2_create(CODEC2_MODE_3200);
         s_c1600_rx = codec2_create(CODEC2_MODE_1600);
         ok = s_c3200_tx && s_c3200_rx && s_c1600_rx;
+        s_c3200_beep = codec2_create(CODEC2_MODE_3200);
         if (ok) {
             struct CODEC2 *c = codec2_create(CODEC2_MODE_3200);
             short z[160] = { 0 };

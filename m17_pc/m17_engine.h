@@ -33,10 +33,20 @@ typedef struct {
     bool gw_net_to_rf;             /* calls from the reflector -> transmitted by our radio (default off) */
     bool gw_keep_src;              /* reflector -> radio: keep the caller's callsign as source (default: ours) */
     unsigned gw_cushion_ms;        /* reflector -> radio: extra silence before the call (default 200) */
-    /* loopback tests: another station calls on the radio channel test_rf_at seconds after the start */
-    char test_rf_wav[260];         /* 8 kHz mono 16 bit */
-    char test_rf_call[M17_CALL_LEN];
-    float test_rf_at;
+    /* relay commands in the destination of a call heard on the radio (the M17Gateway / mspot convention):
+     *   "M17-XXX A" link to reflector M17-XXX module A (looked up in hosts_file), "UNLINK" / "U", "ECHO" / "E"
+     *   (the call is played back), "INFO" / "I" (where we are linked). Such calls are not relayed. The answer is a
+     *   short transmission whose destination field says the result ("M17-XXX A", "UNLINKED", "LINK FAIL") */
+    bool gw_commands;              /* default on */
+    bool gw_replies;               /* answers and echoes are transmitted (default on) */
+    char hosts_file[260];          /* "NAME HOST [PORT]" lines, e.g. hosts\M17Hosts.txt */
+    /* loopback tests: other stations call on the radio channel */
+    struct {
+        char wav[260];             /* 8 kHz mono 16 bit */
+        char call[M17_CALL_LEN], dst[M17_CALL_LEN];
+        float at;                  /* seconds after the start */
+    } test_rf[6];
+    int test_rf_n;
 } me_cfg_t;
 
 typedef enum { ML_OFF, ML_CONNECTING, ML_UP, ML_REFUSED } me_link_t;
