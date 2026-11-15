@@ -9,7 +9,9 @@
  *   c CALL       set the callsign (kept)      s        status
  *   lvl DB       TX level of +-3 symbols, dBFS (default -10)    inv   invert the TX polarity
  *   mic DB       mic gain 0..24 dB            vol N    voice volume 0..33 (30 = 0 dB)
- * Tasks: audio (core 0: I2S, resampling, modulator output, demodulator), codec (core 1: Codec 2, framing). */
+ * Front panel (ui.c): a menu for a rotary encoder and a 21 x 8 character screen; until they are fitted, the serial
+ * console drives it: r / l (turn), p (push), b (long push), "ui" prints the screen, "ui auto" on every change.
+ * Tasks: audio (core 0: I2S, resampling, modulator output, demodulator), codec (core 1: Codec 2, framing), ui. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,7 @@
 #include "esp_vfs_dev.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -34,6 +37,7 @@
 #include "m17.h"
 #include "m17_modem.h"
 #include "m17_rf.h"
+#include "ui.h"
 
 static const char *TAG = "m17";
 
@@ -56,6 +60,10 @@ static char s_call[10] = "N0CALL";
 static float s_tx_dbfs = -10.0f;
 static bool s_tx_invert;
 static int s_mic_db = 24, s_vol = 30;
+static int s_can;                                 /* channel access number 0..15 (in the LSF type) */
+static ui_mode_t s_mode = UI_MODE_DIRECT;
+static char s_refl[256] = "M17-M17";              /* stored reflectors, comma separated */
+static char s_relay_call[10];                     /* the relay that answers our commands (learned) */
 
 static void settings_load(void)
 {
@@ -63,6 +71,26 @@ static void settings_load(void)
     if (nvs_open("m17", NVS_READONLY, &h) == ESP_OK) {
         size_t n = sizeof(s_call);
         nvs_get_str(h, "call", s_call, &n);
+        int32_t v;
+        if (nvs_get_i32(h, "lvl10", &v) == ESP_OK) {
+            s_tx_dbfs = v / 10.0f;
+        }
+        if (nvs_get_i32(h, "mic", &v) == ESP_OK) {
+            s_mic_db = (int)v;
+        }
+        if (nvs_get_i32(h, "vol", &v) == ESP_OK) {
+            s_vol = (int)v;
+        }
+        if (nvs_get_i32(h, "can", &v) == ESP_OK) {
+            s_can = (int)v & 15;
+        }
+        if (nvs_get_i32(h, "mode", &v) == ESP_OK) {
+            s_mode = (ui_mode_t)(v % 3);
+        }
+        n = sizeof(s_refl);
+        nvs_get_str(h, "refl", s_refl, &n);
+        n = sizeof(s_relay_call);
+        nvs_get_str(h, "relay", s_relay_call, &n);
         nvs_close(h);
     }
 }
@@ -72,6 +100,13 @@ static void settings_save(void)
     nvs_handle_t h;
     if (nvs_open("m17", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_str(h, "call", s_call);
+        nvs_set_i32(h, "lvl10", (int32_t)(s_tx_dbfs * 10.0f));
+        nvs_set_i32(h, "mic", s_mic_db);
+        nvs_set_i32(h, "vol", s_vol);
+        nvs_set_i32(h, "can", s_can);
+        nvs_set_i32(h, "mode", (int32_t)s_mode);
+        nvs_set_str(h, "refl", s_refl);
+        nvs_set_str(h, "relay", s_relay_call);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -190,7 +225,18 @@ typedef struct {
 
 static QueueHandle_t s_frames;
 static m17_demod_t s_demod;
-static volatile bool s_ptt_req, s_tx_active, s_dig_loop, s_tx_tone;
+static volatile bool s_ptt_req, s_tx_active, s_dig_loop, s_tx_tone, s_tx_silent;
+/* destination of our voice calls, and of a command being sent */
+static char s_dst[10] = "@ALL", s_dst_prev[10] = "@ALL", s_cmd_dst[10];
+static volatile bool s_dst_once;
+/* answers of the relay, stations heard */
+static char s_relay_state[10];
+static int64_t s_relay_us, s_cmd_us;
+static volatile bool s_cmd_pending;
+static char s_heard[UI_HEARD_N][10];
+static int64_t s_heard_us[UI_HEARD_N];
+static int s_heard_n;
+static float s_rx_evm;
 static volatile int s_diag_ch;                    /* 0 off, 1 tone on left, 2 tone on right */
 static int16_t *s_cap_buf;                        /* "cap": line-in samples for the PC (PSRAM) */
 static volatile uint32_t s_cap_n, s_cap_len;
@@ -326,10 +372,11 @@ static struct {
 static void build_lsf(void)
 {
     memset(s_lsf, 0, sizeof(s_lsf));
-    m17_encode_call("@ALL", s_lsf);
+    m17_encode_call(s_cmd_dst[0] ? s_cmd_dst : s_dst, s_lsf);
     m17_encode_call(s_call, s_lsf + 6);
-    s_lsf[12] = (uint8_t)(M17_TYPE_V3200 >> 8);
-    s_lsf[13] = (uint8_t)M17_TYPE_V3200;
+    uint16_t type = (uint16_t)(M17_TYPE_V3200 | (s_can & 15) << 7);
+    s_lsf[12] = (uint8_t)(type >> 8);
+    s_lsf[13] = (uint8_t)type;
     uint16_t crc = m17_crc(s_lsf, 28);
     s_lsf[28] = (uint8_t)(crc >> 8);
     s_lsf[29] = (uint8_t)crc;
@@ -354,7 +401,8 @@ static void tx_start(void)
     m17_rf_lsf_frame(s_lsf, sym);
     tx_symbols(sym, M17_SYMS_PER_FRAME);
     s_tx_active = true;
-    printf("TX  %s -> @ALL  Codec 2 3200%s\n", s_call, s_tx_test_frames >= 0 ? "  (test)" : "");
+    printf("TX  %s -> %s  Codec 2 3200%s\n", s_call, s_cmd_dst[0] ? s_cmd_dst : s_dst,
+           s_cmd_dst[0] ? "  (command)" : (s_tx_test_frames >= 0 ? "  (test)" : ""));
 }
 
 static void tx_frame(const int16_t *pcm320, bool last)
@@ -386,6 +434,54 @@ static void tx_finish(void)
     s_tx_active = false;
     s_tx_end_us = esp_timer_get_time();
     printf("    end of TX: %u frames (%.2f s)\n", (unsigned)s_fn, s_fn * 0.04);
+    if (s_dst_once) {
+        snprintf(s_dst, sizeof(s_dst), "%s", s_dst_prev);
+        s_dst_once = false;
+    }
+}
+
+/* the destination of an answer from a relay (m17_pc relay mode, M17Gateway-like) */
+static bool is_answer(const char *d)
+{
+    size_t n = strlen(d);
+    return !strcmp(d, "UNLINKED") || !strcmp(d, "LINK FAIL") || !strcmp(d, "NOT FOUND") ||
+           (n == 9 && !strncmp(d, "M17-", 4) && d[7] == ' ');
+}
+
+static void note_station(const char *src, const char *dst)
+{
+    int64_t now = esp_timer_get_time();
+    if (is_answer(dst) || !strcmp(dst, "ECHO")) {
+        bool ours = s_relay_call[0] ? !strcmp(src, s_relay_call) : (s_cmd_pending && now - s_cmd_us < 20000000);
+        if (ours) {
+            if (strcmp(dst, "ECHO")) {
+                snprintf(s_relay_state, sizeof(s_relay_state), "%s", dst);
+                s_relay_us = now;
+            }
+            s_cmd_pending = false;
+            if (strcmp(s_relay_call, src)) {
+                snprintf(s_relay_call, sizeof(s_relay_call), "%s", src);
+                settings_save();
+                printf("relay: answers come from %s (kept)\n", src);
+            }
+            printf("relay: %s\n", dst);
+            return;
+        }
+    }
+    int k = 0;                                    /* move to the top of the heard list */
+    while (k < s_heard_n && strcmp(s_heard[k], src)) {
+        ++k;
+    }
+    if (k == s_heard_n && s_heard_n < UI_HEARD_N) {
+        s_heard_n++;
+    }
+    if (k == UI_HEARD_N) {
+        k = UI_HEARD_N - 1;
+    }
+    memmove(s_heard[1], s_heard[0], sizeof(s_heard[0]) * (size_t)k);
+    memmove(&s_heard_us[1], &s_heard_us[0], sizeof(s_heard_us[0]) * (size_t)k);
+    snprintf(s_heard[0], sizeof(s_heard[0]), "%s", src);
+    s_heard_us[0] = now;
 }
 
 static void rx_end(const char *why)
@@ -431,6 +527,9 @@ static void rx_frame(const frame_msg_t *m)
             m17_decode_call(l + 6, R.src);
             R.type = (uint16_t)(l[12] << 8 | l[13]);
             R.voice1600 = ((R.type >> 1) & 3) == 3;
+            if (!R.self) {
+                note_station(R.src, R.dst);
+            }
             printf("RX  %s -> %s  type %04X (%s)  gain %.0f%s\n", R.src, R.dst, R.type, m17_type_name(R.type),
                    in->gain, in->gain < 0 ? " inverted" : "");
         }
@@ -457,6 +556,7 @@ static void rx_frame(const frame_msg_t *m)
     if (in->evm > R.evm_max) {
         R.evm_max = in->evm;
     }
+    s_rx_evm = in->evm;
     if (R.self) {                                 /* our own frames coming back (loopback)? */
         if (s_tx_frames_total && R.lsf_ok && !strcmp(R.src, s_call)) {
             int be = 0;
@@ -497,7 +597,9 @@ static void codec_task(void *arg)
         if (s_tx_active) {
             while (ring_count(&s_mic8) >= 320 && (s_ptt_req || key || s_tx_test_frames > 0)) {
                 ring_get(&s_mic8, pcm, 320);
-                if (s_tx_tone && s_tx_test_frames > 0) {        /* "tx N tone": 600 Hz, 1 s on / 1 s off */
+                if (s_tx_silent && s_tx_test_frames > 0) {      /* a relay command: a short, silent call */
+                    memset(pcm, 0, sizeof(pcm));
+                } else if (s_tx_tone && s_tx_test_frames > 0) {    /* "tx N tone": 600 Hz, 1 s on / 1 s off */
                     static uint32_t ph;
                     for (int i = 0; i < 320; ++i, ++ph) {
                         bool on = (ph / 8000) % 2 == 0;
@@ -513,7 +615,9 @@ static void codec_task(void *arg)
                     s_tx_active = false;
                     s_tx_end_us = esp_timer_get_time();
                     s_tx_test_frames = -1;
-                    printf("    end of TX test: %u frames\n", (unsigned)s_fn);
+                    printf("    end of TX %s: %u frames\n", s_cmd_dst[0] ? "command" : "test", (unsigned)s_fn);
+                    s_cmd_dst[0] = 0;
+                    s_tx_silent = false;
                 }
             }
             if (s_tx_active && !(s_ptt_req || key || s_tx_test_frames > 0)) {
@@ -524,11 +628,171 @@ static void codec_task(void *arg)
     }
 }
 
+/* ------------------------------------------------------------------ front panel (ui.c) */
+static SemaphoreHandle_t s_ui_mux;
+static bool s_ui_auto;
+
+void app_status(ui_status_t *u)
+{
+    memset(u, 0, sizeof(*u));
+    int64_t now = esp_timer_get_time();
+    snprintf(u->call, sizeof(u->call), "%s", s_call);
+    snprintf(u->dst, sizeof(u->dst), "%s", s_dst);
+    u->dst_once = s_dst_once;
+    u->mode = s_mode;
+    u->tx = s_tx_active;
+    u->rx = R.active && !R.self;
+    snprintf(u->rx_src, sizeof(u->rx_src), "%s", R.src);
+    snprintf(u->rx_dst, sizeof(u->rx_dst), "%s", R.dst);
+    u->rx_evm = s_rx_evm;
+    snprintf(u->relay_state, sizeof(u->relay_state), "%s", s_relay_state);
+    snprintf(u->relay_call, sizeof(u->relay_call), "%s", s_relay_call);
+    u->relay_age_s = s_relay_us ? (uint32_t)((now - s_relay_us) / 1000000) : 0;
+    if (s_cmd_pending && now - s_cmd_us > 20000000) {
+        s_cmd_pending = false;                    /* no answer within 20 s */
+    }
+    u->cmd_pending = s_cmd_pending;
+    u->line_dbfs = s_line_dbfs;
+    u->tx_dbfs = s_tx_dbfs;
+    u->mic_db = s_mic_db;
+    u->vol = s_vol;
+    u->can = s_can;
+    u->heard_n = s_heard_n;
+    for (int i = 0; i < s_heard_n; ++i) {
+        memcpy(u->heard[i], s_heard[i], sizeof(u->heard[i]));
+        u->heard[i][sizeof(u->heard[i]) - 1] = 0;
+        u->heard_age_s[i] = (uint32_t)((now - s_heard_us[i]) / 1000000);
+    }
+    char tmp[sizeof(s_refl)];
+    snprintf(tmp, sizeof(tmp), "%s", s_refl);
+    for (char *t = strtok(tmp, ","); t && u->refl_n < UI_REFL_N; t = strtok(NULL, ",")) {
+        snprintf(u->refl[u->refl_n++], sizeof(u->refl[0]), "%.7s", t);
+    }
+}
+
+void app_set_mode(ui_mode_t m)
+{
+    s_mode = m;
+    settings_save();
+}
+
+void app_set_dst(const char *dst, bool once)
+{
+    if (once) {
+        if (!s_dst_once) {
+            snprintf(s_dst_prev, sizeof(s_dst_prev), "%s", s_dst);
+        }
+    } else {
+        snprintf(s_dst_prev, sizeof(s_dst_prev), "%s", dst);
+    }
+    snprintf(s_dst, sizeof(s_dst), "%s", dst);
+    s_dst_once = once;
+    printf("destination %s%s\n", s_dst, once ? " (next transmission only)" : "");
+}
+
+void app_send_command(const char *dst)
+{
+    if (s_tx_active || s_tx_test_frames > 0) {
+        printf("command %s not sent: transmitting\n", dst);
+        return;
+    }
+    snprintf(s_cmd_dst, sizeof(s_cmd_dst), "%s", dst);
+    s_tx_silent = true;
+    s_tx_tone = false;
+    s_cmd_us = esp_timer_get_time();
+    s_cmd_pending = true;
+    s_tx_test_frames = 13;                        /* 0.5 s */
+    printf("command: a short call to \"%s\"\n", dst);
+}
+
+void app_set_call(const char *call)
+{
+    snprintf(s_call, sizeof(s_call), "%s", call);
+    settings_save();
+    printf("callsign %s (saved)\n", s_call);
+}
+
+void app_set_tx_level(float dbfs)
+{
+    s_tx_dbfs = dbfs;
+    settings_save();
+}
+
+void app_set_mic(int db)
+{
+    s_mic_db = db;
+    es8388_set_gains(0, s_mic_db);
+    settings_save();
+}
+
+void app_set_vol(int vol)
+{
+    s_vol = vol;
+    es8388_set_out(30, s_vol, 0, s_vol);
+    settings_save();
+}
+
+void app_set_can(int can)
+{
+    s_can = can & 15;
+    settings_save();
+}
+
+static void ui_print(void)
+{
+    char rows[UI_ROWS][UI_COLS + 1];
+    xSemaphoreTake(s_ui_mux, portMAX_DELAY);
+    ui_render(rows);
+    xSemaphoreGive(s_ui_mux);
+    printf("+---------------------+\n");
+    for (int r = 0; r < UI_ROWS; ++r) {
+        printf("|%s|\n", rows[r]);
+    }
+    printf("+---------------------+\n");
+}
+
+static void ui_input(const char *keys)
+{
+    for (const char *k = keys; *k; ++k) {
+        ui_event_t e = *k == 'r' ? UI_RIGHT : *k == 'l' ? UI_LEFT : *k == 'p' ? UI_PUSH : UI_BACK;
+        xSemaphoreTake(s_ui_mux, portMAX_DELAY);
+        ui_event(e);
+        xSemaphoreGive(s_ui_mux);
+    }
+    ui_print();
+}
+
+/* "ui auto": print the screen when something on it changes (not for the level bar) */
+static void ui_task(void *arg)
+{
+    uint32_t last = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (!s_ui_auto) {
+            continue;
+        }
+        uint32_t h = (uint32_t)s_tx_active | (uint32_t)(R.active && !R.self) << 1 | (uint32_t)s_cmd_pending << 2 |
+                     (uint32_t)s_heard_n << 3;
+        for (const char *c = s_relay_state; *c; ++c) {
+            h = h * 31u + (uint8_t)*c;
+        }
+        for (const char *c = R.src; *c; ++c) {
+            h = h * 31u + (uint8_t)*c;
+        }
+        if (h != last) {
+            last = h;
+            ui_print();
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ serial commands */
 static void status(void)
 {
-    printf("callsign %s, TX level %.1f dBFS%s, mic gain %d dB, volume %d\n", s_call, s_tx_dbfs,
-           s_tx_invert ? " (inverted)" : "", s_mic_db, s_vol);
+    printf("callsign %s, TX level %.1f dBFS%s, mic gain %d dB, volume %d, CAN %d\n", s_call, s_tx_dbfs,
+           s_tx_invert ? " (inverted)" : "", s_mic_db, s_vol, s_can);
+    printf("destination %s%s, relay %s answers %s, reflectors %s\n", s_dst, s_dst_once ? " (next only)" : "",
+           s_relay_call[0] ? s_relay_call : "(not learned)", s_relay_state[0] ? s_relay_state : "-", s_refl);
     printf("mic %.1f dBFS, line in %.1f dBFS, TX %s, RX %s, polarity learned %+d, frames dropped %u\n", s_mic_dbfs,
            s_line_dbfs, s_tx_active ? "on" : "off", R.active ? "on" : "off", s_demod.polarity,
            (unsigned)s_frames_dropped);
@@ -571,7 +835,7 @@ static void console_task(void *arg)
                 printf("callsign %s (saved)\n", s_call);
             }
         } else if (!strncmp(line, "lvl ", 4)) {
-            s_tx_dbfs = (float)atof(line + 4);
+            app_set_tx_level((float)atof(line + 4));
             printf("TX level %.1f dBFS (from the next transmission)\n", s_tx_dbfs);
         } else if (!strcmp(line, "diag")) {
             /* which output reaches which input: tone on L, then on R; both ADCs on the line-in jack, 0 dB */
@@ -655,17 +919,59 @@ static void console_task(void *arg)
             s_tx_invert = !s_tx_invert;
             printf("TX polarity %s\n", s_tx_invert ? "inverted" : "normal");
         } else if (!strncmp(line, "mic ", 4)) {
-            s_mic_db = atoi(line + 4);
-            es8388_set_gains(0, s_mic_db);
+            app_set_mic(atoi(line + 4));
             printf("mic gain %d dB\n", s_mic_db);
         } else if (!strncmp(line, "vol ", 4)) {
-            s_vol = atoi(line + 4);
-            es8388_set_out(30, s_vol, 0, s_vol);
+            app_set_vol(atoi(line + 4));
             printf("volume %d\n", s_vol);
         } else if (!strcmp(line, "s")) {
             status();
+        } else if (line[0] && strspn(line, "rlpb") == strlen(line)) {
+            ui_input(line);                       /* the encoder: r/l turn, p push, b long push */
+        } else if (!strcmp(line, "ui")) {
+            ui_print();
+        } else if (!strcmp(line, "ui auto")) {
+            s_ui_auto = !s_ui_auto;
+            printf("screen printed on changes: %s\n", s_ui_auto ? "on" : "off");
+        } else if (!strncmp(line, "dst ", 4)) {
+            char d[10] = { 0 };
+            for (int i = 0; i < 9 && line[4 + i]; ++i) {
+                char ch = line[4 + i];
+                d[i] = (char)(ch >= 'a' && ch <= 'z' ? ch - 32 : ch);
+            }
+            app_set_dst(d, false);
+        } else if (!strcmp(line, "refl")) {
+            printf("reflectors: %s\n", s_refl);
+        } else if (!strncmp(line, "refl add ", 9) || !strncmp(line, "refl del ", 9)) {
+            char name[8] = { 0 };
+            for (int i = 0; i < 7 && line[9 + i]; ++i) {
+                char ch = line[9 + i];
+                name[i] = (char)(ch >= 'a' && ch <= 'z' ? ch - 32 : ch);
+            }
+            char out[sizeof(s_refl)] = "", tmp[sizeof(s_refl)];
+            snprintf(tmp, sizeof(tmp), "%s", s_refl);
+            int n = 0;
+            for (char *t = strtok(tmp, ","); t; t = strtok(NULL, ",")) {
+                if (strcmp(t, name) && n < UI_REFL_N) {
+                    snprintf(out + strlen(out), sizeof(out) - strlen(out), "%s%s", out[0] ? "," : "", t);
+                    n++;
+                }
+            }
+            if (line[5] == 'a' && name[0] && n < UI_REFL_N) {
+                snprintf(out + strlen(out), sizeof(out) - strlen(out), "%s%s", out[0] ? "," : "", name);
+            }
+            snprintf(s_refl, sizeof(s_refl), "%s", out);
+            settings_save();
+            printf("reflectors: %s\n", s_refl);
+        } else if (!strcmp(line, "relay forget")) {
+            s_relay_call[0] = 0;
+            s_relay_state[0] = 0;
+            settings_save();
+            printf("relay forgotten: the next answer to a command teaches it again\n");
         } else if (line[0]) {
-            printf("commands: t | tx N [tone] | c CALL | s | lvl DB | inv | mic DB | vol N | dl | diag | cap S [tx] | keys\n");
+            printf("commands: t | tx N [tone] | c CALL | s | lvl DB | inv | mic DB | vol N | dl | diag | cap S [tx] | keys\n"
+                   "panel:    r l p b (turn right/left, push, long push) | ui | ui auto | dst CALL | refl [add|del NAME]\n"
+                   "          | relay forget\n");
         }
     }
 }
@@ -743,7 +1049,11 @@ void app_main(void)
     xTaskCreatePinnedToCore(audio_task, "audio", 6144, NULL, 20, NULL, 0);
     xTaskCreatePinnedToCore(demod_task, "demod", 8192, NULL, 15, NULL, 0);
     xTaskCreatePinnedToCore(codec_task, "codec", 32768, NULL, 10, NULL, 1);
-    xTaskCreatePinnedToCore(console_task, "console", 4096, NULL, 5, NULL, 1);
+    s_ui_mux = xSemaphoreCreateMutex();
+    ui_init();
+    xTaskCreatePinnedToCore(console_task, "console", 6144, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(ui_task, "ui", 4096, NULL, 4, NULL, 1);
     printf("\nm17_modem ready. callsign %s. PTT: KEY1 or \"t\"; \"tx 5\" sends 5 s; \"s\" status.\n", s_call);
     printf("PHONE tip = M17 modulation (to the radio), PHONE ring + speaker = received voice; LINE IN tip = M17 input\n");
+    printf("front panel on the serial port: \"ui\" shows the screen, r / l / p / b turn and push (b = long push)\n");
 }
