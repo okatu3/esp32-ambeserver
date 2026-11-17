@@ -33,3 +33,4 @@ build_m17_modem_pc/
 m17_modem/esp32/build/
 m17_modem/esp32/sdkconfig
 m17_modem/esp32/sdkconfig.old
+build_taikou/
