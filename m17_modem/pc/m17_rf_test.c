@@ -2,6 +2,11 @@
  *   voice.wav (8 kHz mono) -> Codec 2 3200 -> M17 stream (preamble, LSF, stream frames, EoT) -> 4FSK 48 kHz
  *   -> channel (gain, polarity, DC, AC-coupling high-pass, noise) -> demodulator -> frames -> Codec 2 -> out.wav
  * usage: m17_rf_test [voice.wav [out.wav [baseband.wav]]] [--invert] [--dc X] [--hp HZ] [--snr DB] [--gain G]
+ *   radio without a data port (fm_path.h): --radio  model of the TX audio path (IC-705 guess: HP 300 Hz 2nd order,
+ *     pre-emphasis 750 us, limiter, LP 3 kHz) -> FM -> 12 kHz IF -> discriminator; --rx-af: the AF path instead of IF
+ *     --r-hp HZ --r-hp-order N --r-preemph US --r-lp HZ --limit X (x +3 symbol) --offset HZ
+ *     --precomp FLOOR_HZ  TX precompensation (inverse high-pass down to FLOOR_HZ, de-emphasis); --pre-gain dB
+ *     --snr DB is then the carrier-to-noise ratio at the IF (or the SNR at the AF output)
  * Exit code 0 when every check passes and the payload comes back bit-exact (with the channel left clean). */
 #include <math.h>
 #include <stdio.h>
@@ -10,6 +15,7 @@
 
 #include <codec2.h>
 
+#include "fm_path.h"
 #include "m17.h"
 #include "m17_modem.h"
 #include "m17_rf.h"
@@ -233,6 +239,10 @@ static void on_frame(void *ctx, const m17_sync_info_t *in, const uint16_t *soft)
 
 int main(int argc, char **argv)
 {
+    int use_radio = 0, rx_af = 0;
+    double limit = 1.5, offset = 0, pre_floor = 0, pre_db = 0;
+    fmp_radio_t rr;
+    fmp_radio_ic705_guess(&rr);
     const char *in_wav = NULL, *out_wav = NULL, *bb_wav = NULL;
     int invert = 0;
     double dc = 0, hp = 0, snr = 99, gain = 1;
@@ -242,6 +252,17 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--hp") && i + 1 < argc) hp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--snr") && i + 1 < argc) snr = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gain") && i + 1 < argc) gain = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--radio")) use_radio = 1;
+        else if (!strcmp(argv[i], "--rx-af")) rx_af = 1;
+        else if (!strcmp(argv[i], "--r-hp") && i + 1 < argc) rr.hp_hz = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--r-hp-order") && i + 1 < argc) rr.hp_order = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--r-preemph") && i + 1 < argc) rr.preemph_us = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--r-lp") && i + 1 < argc) rr.lp_hz = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--offset") && i + 1 < argc) offset = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--precomp") && i + 1 < argc) pre_floor = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--pre-gain") && i + 1 < argc) pre_db = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--pre-eps") && i + 1 < argc) fmp_pre_eps_hz = atof(argv[++i]);
         else if (!in_wav) in_wav = argv[i];
         else if (!out_wav) out_wav = argv[i];
         else bb_wav = argv[i];
@@ -311,6 +332,41 @@ int main(int argc, char **argv)
     m17_mod_t mod;
     m17_mod_init(&mod, 12000);
     int ns = m17_mod(&mod, sym, k, bb);
+
+    if (use_radio) {
+        /* TX precompensation, the radio's audio path, FM, the receiver (IF + discriminator, or AF) */
+        double pg = pow(10, pre_db / 20);
+        if (pre_floor > 0) {
+            fmp_pre_t pre;
+            fmp_pre_init(&pre, &rr, pre_floor, pg);
+            int pk0 = 0, pk1 = 0;
+            for (int i = 0; i < ns; ++i) pk0 = abs(bb[i]) > pk0 ? abs(bb[i]) : pk0;
+            fmp_pre_run(&pre, bb, ns);
+            for (int i = 0; i < ns; ++i) pk1 = abs(bb[i]) > pk1 ? abs(bb[i]) : pk1;
+            printf("precomp: floor %.1f Hz, inverse gain up to %.1f dB, gain %.1f dB, peak %d -> %d, clipped %u\n",
+                   pre_floor, 20 * log10(fmp_pre_peak_gain(&rr, pre_floor)), pre_db, pk0, pk1, pre.clips);
+        }
+        fmp_model_t md;
+        fmp_model_init(&md, &rr, limit, !rx_af, 1.0 / (12000.0 * (pre_floor > 0 ? pg : 1.0)));
+        md.rx_offset_hz = offset;
+        double nr = snr < 90 ? (rx_af ? FMP_NOMINAL * 0.6 : 8000.0 / sqrt(2.0)) * pow(10, -snr / 20) : 0;
+        int16_t *o = malloc((size_t)ns * 2);
+        unsigned seed = 12345;
+        fmp_model_run(&md, bb, NULL, o, ns, nr, &seed);
+        if (!rx_af) {
+            fmp_ifdem_t dem;
+            fmp_ifdem_init(&dem, FMP_IF_HZ);
+            fmp_ifdem_run(&dem, o, bb, ns);
+            printf("receiver: 12 kHz IF -> discriminator, offset seen %.0f Hz\n", fmp_ifdem_offset_hz(&dem));
+        } else {
+            memcpy(bb, o, (size_t)ns * 2);
+            printf("receiver: AF path (de-emphasis, voice band)\n");
+        }
+        free(o);
+        printf("radio: HP %.0f Hz order %d, pre-emphasis %.0f us, LP %.0f Hz, limiter %.2f (touched %.2f %%)\n",
+               rr.hp_hz, rr.hp_order, rr.preemph_us, rr.lp_hz, limit, 100.0 * md.limited / ns);
+        snr = 99;                                     /* the noise is in already */
+    }
 
     /* channel */
     double hp_a = hp > 0 ? exp(-2 * M_PI * hp / M17_FS) : 0, hp_x = 0, hp_y = 0;

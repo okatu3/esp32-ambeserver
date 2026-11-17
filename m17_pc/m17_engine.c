@@ -721,6 +721,10 @@ static void tx_finish(double t)
     T.active = false;
     wav_close(&T.mic);
     logf_("    end of transmission: %.1f s, %u packets", (t - T.start) / 1000.0, T.packets);
+    if (s_radio && radio_stats(s_radio)->pre_clips) {
+        logf_("[W] TX precompensation clipped %u samples so far: lower the gain after it (--pre-gain)",
+              radio_stats(s_radio)->pre_clips);
+    }
     EnterCriticalSection(&s_cs);
     s_st.tx = false;
     LeaveCriticalSection(&s_cs);
@@ -771,6 +775,9 @@ static void radio_events(double t)
             }
             if (RS.frames) {
                 logf_("    RF: %u frames, EVM avg %.3f max %.3f", RS.frames, RS.evm_sum / RS.frames, RS.evm_max);
+                if (s_cfg.rc.rx_if) {
+                    logf_("    IF: frequency offset %+.0f Hz", radio_stats(s_radio)->if_offset_hz);
+                }
             }
             memset(&RS, 0, sizeof(RS));
             s_rad_sid++;

@@ -217,8 +217,40 @@ static void read_frame(m17_demod_t *d, const int8_t *p, m17_sync_info_t *info, u
     info->dc = bdc;
     info->timing = bf;
     float evm = 0, ibg = fabsf(bg) > 1e-6f ? 1.0f / bg : 0;
+    /* baseline wander (the lows cut by AC coupling or a radio's high-pass): the DC follows the residuals of the
+     * decided symbols, averaged over +-BW symbols (zero phase), two passes; kept only when it lowers the error */
+    float base[M17_SYMS_PER_FRAME];
+    memset(base, 0, sizeof(base));
+    if (ibg != 0) {
+        enum { BW = 6 };
+        float r[M17_SYMS_PER_FRAME], tb[M17_SYMS_PER_FRAME], e0 = 0, e1 = 0;
+        memset(tb, 0, sizeof(tb));
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int k = 0; k < M17_SYMS_PER_FRAME; ++k) {
+                float s = (yb[k] - bdc - tb[k]) * ibg;
+                float lv = k < 8 ? p[k] : slice_level(s);
+                r[k] = yb[k] - bdc - bg * lv;
+            }
+            for (int k = 0; k < M17_SYMS_PER_FRAME; ++k) {
+                int a = k - BW < 0 ? 0 : k - BW, b = k + BW >= M17_SYMS_PER_FRAME ? M17_SYMS_PER_FRAME - 1 : k + BW;
+                float sum = 0;
+                for (int j = a; j <= b; ++j) {
+                    sum += r[j];
+                }
+                tb[k] = sum / (float)(b - a + 1);
+            }
+        }
+        for (int k = 8; k < M17_SYMS_PER_FRAME; ++k) {
+            float s0 = (yb[k] - bdc) * ibg, s1 = (yb[k] - bdc - tb[k]) * ibg;
+            e0 += (s0 - slice_level(s0)) * (s0 - slice_level(s0));
+            e1 += (s1 - slice_level(s1)) * (s1 - slice_level(s1));
+        }
+        if (e1 < e0) {
+            memcpy(base, tb, sizeof(base));
+        }
+    }
     for (int k = 0; k < M17_PAYLOAD_BITS / 2; ++k) {
-        float s = (yb[8 + k] - bdc) * ibg;
+        float s = (yb[8 + k] - bdc - base[8 + k]) * ibg;
         float lv = slice_level(s);
         evm += (s - lv) * (s - lv);
         float msb = 0.5f - 0.5f * s;                   /* +1/+3 -> 0, -1/-3 -> 1 */

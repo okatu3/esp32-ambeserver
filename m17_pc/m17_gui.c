@@ -505,6 +505,13 @@ static void radio_cfg_from_ini(radio_cfg_t *c)
     c->tx_delay_ms = (unsigned)rini(L"tx_delay_ms", 150);
     c->tx_tail_ms = (unsigned)rini(L"tx_tail_ms", 50);
     c->tx_invert = rini(L"tx_invert", 0) != 0;
+    /* a radio without a data port over USB (IC-705): IF receive and TX precompensation */
+    c->rx_if = c->tx_pre = rini(L"usb_radio", 0) != 0;
+    c->pre_floor_hz = (float)rini(L"pre_floor_hz", 50);
+    c->pre_gain_db = (float)rini(L"pre_gain_db", -36);
+    c->pre_radio.hp_hz = rini(L"radio_hp_hz", 300);
+    c->pre_radio.hp_order = rini(L"radio_hp_order", 2);
+    c->pre_radio.preemph_us = rini(L"radio_preemph_us", 0);
 }
 
 static void wput_int(const wchar_t *key, int v)
@@ -514,7 +521,8 @@ static void wput_int(const wchar_t *key, int v)
     WritePrivateProfileStringW(L"radio", key, w, s_ini);
 }
 
-enum { RD_IN = 300, RD_OUT, RD_PTT, RD_PORT, RD_ADDR, RD_BAUD, RD_LEVEL, RD_DELAY, RD_INV, RD_N2R, RD_KEEP, RD_CMD };
+enum { RD_IN = 300, RD_OUT, RD_PTT, RD_PORT, RD_ADDR, RD_BAUD, RD_LEVEL, RD_DELAY, RD_INV, RD_N2R, RD_KEEP, RD_CMD,
+       RD_USB, RD_FLOOR, RD_PGAIN };
 static struct {
     HWND wnd;
     bool done, ok;
@@ -582,7 +590,7 @@ static void radio_settings(void)
     }
     radio_cfg_t c;
     radio_cfg_from_ini(&c);
-    RECT pr, r = { 0, 0, S(520), S(500) };
+    RECT pr, r = { 0, 0, S(520), S(602) };
     GetWindowRect(s_wnd, &pr);
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
@@ -591,7 +599,7 @@ static void radio_settings(void)
                                pr.left + ((pr.right - pr.left) - w) / 2, pr.top + S(60), w, hgt, s_wnd, NULL,
                                GetModuleHandleW(NULL), NULL);
     int y = 12;
-    rd_add(L"STATIC", L"無線機の DATA 端子（9600bps 用）を、PC の音声入出力につなぎます。",
+    rd_add(L"STATIC", L"DATA 端子（9600bps 用）を PC の音声入出力に、または IC-705 を USB でつなぎます。",
            SS_LEFT, 12, y, 496, 20, 0);
     y += 30;
     rd_add(L"STATIC", L"入力（無線機から）", SS_LEFT, 12, y + 3, 130, 20, 0);
@@ -632,7 +640,21 @@ static void radio_settings(void)
     HWND inv = rd_add(L"BUTTON", L"送信の変調を反転する（相手のログに inverted と出るとき）", BS_AUTOCHECKBOX | WS_TABSTOP, 12, y,
                       496, 24, RD_INV);
     SendMessageW(inv, BM_SETCHECK, c.tx_invert ? BST_CHECKED : 0, 0);
-    y += 34;
+    y += 30;
+    HWND usb = rd_add(L"BUTTON", L"DATA 端子のない無線機を USB でつなぐ（IC-705）",
+                      BS_AUTOCHECKBOX | WS_TABSTOP, 12, y, 496, 24, RD_USB);
+    SendMessageW(usb, BM_SETCHECK, c.rx_if ? BST_CHECKED : 0, 0);
+    y += 28;
+    rd_add(L"STATIC", L"低域をどこまで戻すか（Hz）", SS_LEFT, 30, y + 3, 170, 20, 0);
+    swprintf(t, 32, L"%d", (int)c.pre_floor_hz);
+    HWND floor_ = rd_add(L"EDIT", t, ES_NUMBER | WS_TABSTOP, 204, y, 50, 24, RD_FLOOR);
+    rd_add(L"STATIC", L"補正後のレベル（dB）", SS_LEFT, 268, y + 3, 150, 20, 0);
+    swprintf(t, 32, L"%d", (int)c.pre_gain_db);
+    HWND pgain = rd_add(L"EDIT", t, WS_TABSTOP, 420, y, 50, 24, RD_PGAIN);
+    y += 28;
+    rd_add(L"STATIC", L"受信は 12 kHz の IF、送信は補正。無線機は FM-D、DATA MOD＝USB、USB AF/IF Output＝IF。"
+           L"補正の値は推定です（実測で合わせる）。", SS_LEFT, 30, y, 478, 40, 0);
+    y += 46;
     rd_add(L"STATIC", L"中継モード：無線機で受けた通話は、いつもリフレクターへ送ります。", SS_LEFT, 12, y, 496, 20, 0);
     y += 24;
     HWND n2r = rd_add(L"BUTTON", L"リフレクターの通話を、無線機から送信する（自動で電波が出ます）", BS_AUTOCHECKBOX | WS_TABSTOP,
@@ -643,12 +665,13 @@ static void radio_settings(void)
                        BS_AUTOCHECKBOX | WS_TABSTOP, 30, y, 478, 24, RD_KEEP);
     SendMessageW(keep, BM_SETCHECK, rini(L"relay_keep_src", 0) ? BST_CHECKED : 0, 0);
     y += 26;
-    HWND cmd = rd_add(L"BUTTON", L"無線機からの操作を受け付け、返事を送信する（宛先 M17-XXX A・UNLINK・ECHO・INFO）",
+    HWND cmd = rd_add(L"BUTTON", L"無線機からの操作を受け付け、返事を送信する（宛先 M17-XXX A・UNLINK など）",
                       BS_AUTOCHECKBOX | WS_TABSTOP, 12, y, 496, 24, RD_CMD);
     SendMessageW(cmd, BM_SETCHECK, rini(L"relay_commands", 1) ? BST_CHECKED : 0, 0);
     y += 34;
     rd_add(L"STATIC",
            L"マイク端子・スピーカー端子では通りません（300 Hz〜3 kHz の帯域では復調できないことを試験で確認）。"
+           L"USB の IC-705 は、PC の中の模型で確かめただけです。"
            L"送信の前に、免許の範囲か確かめてください。調整はダミーロードで。",
            SS_LEFT, 12, y, 496, 60, 0);
     y += 70;
@@ -680,6 +703,11 @@ static void radio_settings(void)
         GetWindowTextW(delay, t, 32);
         WritePrivateProfileStringW(L"radio", L"tx_delay_ms", t, s_ini);
         wput_int(L"tx_invert", SendMessageW(inv, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        wput_int(L"usb_radio", SendMessageW(usb, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        GetWindowTextW(floor_, t, 32);
+        wput_int(L"pre_floor_hz", _wtoi(t) < 5 ? 5 : _wtoi(t));
+        GetWindowTextW(pgain, t, 32);
+        wput_int(L"pre_gain_db", _wtoi(t) > 0 ? 0 : _wtoi(t));
         wput_int(L"relay_to_radio", SendMessageW(n2r, BM_GETCHECK, 0, 0) == BST_CHECKED);
         wput_int(L"relay_keep_src", SendMessageW(keep, BM_GETCHECK, 0, 0) == BST_CHECKED);
         wput_int(L"relay_commands", SendMessageW(cmd, BM_GETCHECK, 0, 0) == BST_CHECKED);

@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "fm_path.h"
 #include "m17_rf.h"
 
 #define RADIO_DEV_DEFAULT  (-1)
@@ -26,7 +27,17 @@ typedef struct {
     bool tx_invert;                        /* some radios invert the modulation */
     float loop_snr_db;                     /* RADIO_DEV_LOOP: noise, 0 = none */
     bool loop_voice_band;                  /* RADIO_DEV_LOOP: 300 Hz high-pass and 3 kHz low-pass on both sides */
+    /* a radio without a data port, e.g. the IC-705 over USB (fm_path.h) */
+    bool rx_if;                            /* the input is the radio's 12 kHz IF: an FM discriminator here */
+    bool tx_pre;                           /* precompensate the radio's TX audio path (inverse high-pass, de-emphasis) */
+    fmp_radio_t pre_radio;                 /* that path: high-pass, order, pre-emphasis, low-pass */
+    float pre_floor_hz;                    /* lowest frequency restored (e.g. 50) */
+    float pre_gain_db;                     /* after the precompensation (e.g. -24): room for the boosted lows */
+    bool loop_radio;                       /* RADIO_DEV_LOOP: through a model of such a radio (pre_radio, limiter) */
+    float loop_limit;                      /* that model's limiter, x the +3 symbol deviation (1.5) */
 } radio_cfg_t;
+
+void radio_cfg_ic705(radio_cfg_t *c);      /* IC-705 over USB: CI-V A4 115200, IF receive, precompensation (a guess) */
 
 typedef enum { RE_LSF, RE_STREAM, RE_END } radio_evt_kind_t;
 
@@ -44,6 +55,8 @@ typedef struct {
     float in_dbfs;                         /* input level, slow average */
     unsigned tx_underruns;                 /* output ran dry while keyed (the frames came too late) */
     unsigned frames_rx;
+    unsigned pre_clips;                    /* samples the precompensation clipped (lower pre_gain_db) */
+    float if_offset_hz;                    /* rx_if: frequency error of the received signal */
 } radio_stats_t;
 
 typedef struct radio radio_t;

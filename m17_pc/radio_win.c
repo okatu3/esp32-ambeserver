@@ -46,6 +46,10 @@ struct radio {
     unsigned ihead, icount;
     m17_mod_t imod;
     biquad_t tx_bq[3], rx_bq[3];           /* loopback voice band: HP 300, LP 3000 (x2) */
+    fmp_pre_t pre;                         /* tx_pre */
+    fmp_ifdem_t ifd;                       /* rx_if */
+    fmp_model_t model;                     /* loop_radio */
+    unsigned seed;
     /* receive */
     bool in_call, have_lsf;
     uint8_t lsf[M17_LSF_BYTES], lich[M17_LSF_BYTES];
@@ -77,6 +81,24 @@ void radio_default_cfg(radio_cfg_t *c)
     c->tx_delay_ms = 150;
     c->tx_tail_ms = 50;
     c->tx_dbfs = -10.0f;
+    fmp_radio_ic705_guess(&c->pre_radio);
+    c->pre_floor_hz = 50.0f;
+    c->pre_gain_db = -36.0f;
+    c->loop_limit = 1.5f;
+}
+
+void radio_cfg_ic705(radio_cfg_t *c)
+{
+    if (c->ptt_port[0]) {                 /* the port comes from --ptt COMx:civ or the settings */
+        c->ptt = RP_CIV;
+    }
+    c->civ_addr = 0xA4;
+    c->civ_baud = 115200;
+    c->rx_if = true;
+    c->tx_pre = true;
+    if (c->tx_delay_ms < 200) {
+        c->tx_delay_ms = 200;
+    }
 }
 
 /* ---------------------------------------------------------------- filters for the loopback test (RBJ biquads) */
@@ -265,14 +287,37 @@ static void demod_push(radio_t *r, const int16_t *x, int n)
     e /= (float)n;
     float db = e < 1 ? -99.0f : 10.0f * log10f(e / (32768.0f * 32768.0f));
     r->st.in_dbfs = r->st.in_dbfs < -98 ? db : 0.95f * r->st.in_dbfs + 0.05f * db;
+    if (r->c.rx_if) {                     /* 12 kHz IF -> FM discriminator -> baseband */
+        int16_t t[480];
+        while (n > 0) {
+            int k = n > 480 ? 480 : n;
+            fmp_ifdem_run(&r->ifd, x, t, k);
+            m17_demod_push(&r->dem, t, k);
+            x += k;
+            n -= k;
+        }
+        r->st.if_offset_hz = (float)fmp_ifdem_offset_hz(&r->ifd);
+        return;
+    }
     m17_demod_push(&r->dem, x, n);
 }
 
 /* ---------------------------------------------------------------- transmit */
 static void fifo_put(radio_t *r, const int16_t *x, unsigned n)
 {
-    for (unsigned i = 0; i < n && r->fcount < FIFO_LEN; ++i) {
-        r->fifo[(r->fhead + r->fcount++) % FIFO_LEN] = x[i];
+    int16_t t[480];
+    while (n > 0) {
+        unsigned k = n > 480 ? 480 : n;
+        memcpy(t, x, k * sizeof(int16_t));
+        if (r->c.tx_pre) {
+            fmp_pre_run(&r->pre, t, (int)k);
+            r->st.pre_clips = r->pre.clips;
+        }
+        for (unsigned i = 0; i < k && r->fcount < FIFO_LEN; ++i) {
+            r->fifo[(r->fhead + r->fcount++) % FIFO_LEN] = t[i];
+        }
+        x += k;
+        n -= k;
     }
 }
 
@@ -306,6 +351,11 @@ void radio_tx_begin_ex(radio_t *r, const uint8_t lsf[M17_LSF_BYTES], unsigned ex
     memcpy(r->lsf_tx, lsf, M17_LSF_BYTES);
     if (!r->keyed) {
         m17_mod_init(&r->mod, 32767.0f * powf(10.0f, r->c.tx_dbfs / 20.0f));
+        if (r->c.tx_pre) {
+            unsigned clips = r->pre.clips;
+            fmp_pre_init(&r->pre, &r->c.pre_radio, r->c.pre_floor_hz, pow(10.0, r->c.pre_gain_db / 20.0));
+            r->pre.clips = clips;
+        }
         ptt_set(r, true);
         r->keyed = true;
         static const int16_t z[480];
@@ -339,6 +389,10 @@ void radio_tx_end(radio_t *r)
     put_syms(r, sym, M17_SYMS_PER_FRAME);
     memset(sym, 0, 16);                   /* lets the filter ring out */
     put_syms(r, sym, 16);
+    if (r->c.tx_pre) {                    /* and the precompensation's boosted lows */
+        static const int16_t z[960];
+        fifo_put(r, z, 960);
+    }
     r->ending = true;
     r->tail_until = 0;
 }
@@ -379,6 +433,35 @@ static void pump_loop(radio_t *r)
     float nsig = r->c.loop_snr_db != 0.0f
                      ? 32767.0f * powf(10.0f, r->c.tx_dbfs / 20.0f) * 0.6f * powf(10.0f, -r->c.loop_snr_db / 20.0f)
                      : 0.0f;
+    if (r->c.loop_radio) {
+        static int16_t tx[BUF];
+        static float other[BUF];
+        double base = 32767.0 * pow(10.0, r->c.tx_dbfs / 20.0);
+        double nr = r->c.loop_snr_db != 0.0f
+                        ? (r->c.rx_if ? 8000.0 / sqrt(2.0) : FMP_NOMINAL * 0.6) * pow(10.0, -r->c.loop_snr_db / 20.0)
+                        : 0.0;
+        while (r->loop_done + BUF <= due) {
+            for (int i = 0; i < BUF; ++i) {
+                tx[i] = 0;
+                if (r->keyed && r->fcount) {
+                    tx[i] = fifo_get(r);
+                } else if (r->keyed && !r->ending && i == 0) {
+                    r->st.tx_underruns++;
+                }
+                other[i] = 0;
+                if (r->icount) {                  /* another station with a flat (data port) transmitter */
+                    other[i] = (float)(r->inj[r->ihead] / base);
+                    r->ihead = (r->ihead + 1) % INJ_LEN;
+                    r->icount--;
+                }
+            }
+            fmp_model_run(&r->model, tx, other, x, BUF, nr, &r->seed);
+            r->loop_done += BUF;
+            demod_push(r, x, BUF);
+            check_unkey(r, false);
+        }
+        return;
+    }
     while (r->loop_done + BUF <= due) {
         for (int i = 0; i < BUF; ++i) {
             float v = 0;
@@ -533,10 +616,25 @@ radio_t *radio_open(const radio_cfg_t *c, radio_log_fn log)
     r->st.in_dbfs = -99;
     r->loop = c->in_device == RADIO_DEV_LOOP || c->out_device == RADIO_DEV_LOOP;
     m17_demod_init(&r->dem, on_frame, r);
+    r->seed = 4321;
+    if (c->rx_if) {
+        fmp_ifdem_init(&r->ifd, FMP_IF_HZ);
+    }
+    if (c->tx_pre) {
+        fmp_pre_init(&r->pre, &c->pre_radio, c->pre_floor_hz, pow(10.0, c->pre_gain_db / 20.0));
+    }
     if (!ptt_open(r)) {
         free(r->fifo);
         free(r);
         return NULL;
+    }
+    if (c->rx_if) {
+        log("radio: the input is the radio's 12 kHz IF (FM discriminator here)");
+    }
+    if (c->tx_pre) {
+        log("radio: TX precompensation for HP %.0f Hz (order %d), pre-emphasis %.0f us: lows restored down to %.0f Hz, "
+            "gain %.1f dB", c->pre_radio.hp_hz, c->pre_radio.hp_order, c->pre_radio.preemph_us, c->pre_floor_hz,
+            c->pre_gain_db);
     }
     if (r->loop) {
         r->t0 = now_ms();
@@ -546,6 +644,13 @@ radio_t *radio_open(const radio_cfg_t *c, radio_log_fn log)
         memcpy(r->rx_bq, r->tx_bq, sizeof(r->rx_bq));
         log("radio: internal loopback (no sound card)%s, SNR %s", c->loop_voice_band ? ", voice band 300-3000 Hz" : "",
             c->loop_snr_db != 0.0f ? "set" : "no noise");
+        if (c->loop_radio) {
+            double base = 32767.0 * pow(10.0, c->tx_dbfs / 20.0) * (c->tx_pre ? pow(10.0, c->pre_gain_db / 20.0) : 1.0);
+            fmp_model_init(&r->model, &c->pre_radio, c->loop_limit, c->rx_if, 1.0 / base);
+            log("    through a radio model: HP %.0f Hz (order %d), pre-emphasis %.0f us, limiter %.2f, LP %.0f Hz, "
+                "receiver %s", c->pre_radio.hp_hz, c->pre_radio.hp_order, c->pre_radio.preemph_us, c->loop_limit,
+                c->pre_radio.lp_hz, c->rx_if ? "12 kHz IF" : "AF (de-emphasis, voice band)");
+        }
         if (c->loop_snr_db != 0.0f) {
             log("    noise: SNR %.1f dB", c->loop_snr_db);
         }

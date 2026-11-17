@@ -14,7 +14,7 @@ set_target_properties(codec2 PROPERTIES IMPORTED_LOCATION "${CODEC2_BUILD}/src/l
 
 # radio mode: the M17 over-the-air layer and 4FSK modem of m17_modem/core (also used by the ESP32-A1S modem)
 set(RF_CORE "${CMAKE_CURRENT_LIST_DIR}/../m17_modem/core")
-add_library(m17_core STATIC m17.c m17_engine.c m17_parrot.c license_check.c audio_win.c mic_win.c wav.c radio_win.c
+add_library(m17_core STATIC m17.c m17_engine.c m17_parrot.c license_check.c audio_win.c mic_win.c wav.c radio_win.c fm_path.c
             "${RF_CORE}/m17_rf.c" "${RF_CORE}/m17_modem.c")
 target_include_directories(m17_core PUBLIC "${CMAKE_CURRENT_LIST_DIR}" "${RF_CORE}")
 target_compile_definitions(m17_core PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)

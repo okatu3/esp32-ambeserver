@@ -14,6 +14,14 @@
  *     --tx-level dBFS    level of the +3 symbols (-10)  --tx-delay MS  silence after keying (150)  --tx-invert
  *     --loop             no sound card: the output goes straight back to the input (tests)
  *     --loop-snr dB      with noise                     --loop-voice-band  through 300 Hz - 3 kHz filters both ways
+ *   a radio without a 9600 port, over USB audio (IC-705: fm_path.h):
+ *     --ic705            CI-V PTT A4 115200, receive the 12 kHz IF, TX precompensation (--ptt COMx:civ for the port)
+ *     --rdev NAME        sound input and output whose names contain NAME (e.g. "USB Audio CODEC")
+ *     --rx-if / --rx-af  the radio's USB output is the 12 kHz IF / audio
+ *     --tx-pre FLOOR_HZ  precompensate the radio's TX audio path down to FLOOR_HZ (50); --no-tx-pre
+ *     --pre-gain dB      level after the precompensation (-36)
+ *     --radio-hp HZ --radio-hp-order N --radio-preemph US --radio-lp HZ   that path (guess: 300, 2, 0 = none in FM-D, 3000)
+ *     --loop-radio       with --loop: through a model of that radio (--loop-limit X, x the +3 symbol, 1.5)
  *   m17_cli HOST CALLSIGN --relay [radio options]    (relay: the radio and a reflector at the same time)
  *     radio -> reflector is on (--no-relay-to-net turns it off); --relay-to-radio also transmits the reflector's
  *     calls on the radio, with our callsign as source (--relay-keep-src: the caller's).
@@ -56,6 +64,25 @@ static void upper(char *p)
             *p = (char)(*p - 32);
         }
     }
+}
+
+/* index of the first sound input / output whose name contains part (case-insensitive), -1 if none */
+static int find_dev(bool input, const char *part)
+{
+    char want[64];
+    snprintf(want, sizeof(want), "%s", part);
+    upper(want);
+    int n = input ? radio_in_count() : radio_out_count();
+    for (int i = 0; i < n; ++i) {
+        char name[96];
+        if (input ? radio_in_name(i, name, sizeof(name)) : radio_out_name(i, name, sizeof(name))) {
+            upper(name);
+            if (strstr(name, want)) {
+                return i;
+            }
+        }
+    }
+    return -1;
 }
 
 int main(int argc, char **argv)
@@ -131,6 +158,27 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--tx-level")) { c.rc.tx_dbfs = (float)atof(v); ++i; }
         else if (!strcmp(a, "--tx-delay")) { c.rc.tx_delay_ms = (unsigned)atoi(v); ++i; }
         else if (!strcmp(a, "--tx-invert")) { c.rc.tx_invert = true; }
+        else if (!strcmp(a, "--ic705")) { radio_cfg_ic705(&c.rc); }
+        else if (!strcmp(a, "--rdev")) {                    /* pick the radio's sound devices by name */
+            c.rc.in_device = find_dev(true, v);
+            c.rc.out_device = find_dev(false, v);
+            if (c.rc.in_device < 0 || c.rc.out_device < 0) {
+                fprintf(stderr, "no sound input and output named like \"%s\" (see -l)\n", v);
+                return 2;
+            }
+            ++i;
+        }
+        else if (!strcmp(a, "--rx-if")) { c.rc.rx_if = true; }
+        else if (!strcmp(a, "--rx-af")) { c.rc.rx_if = false; }
+        else if (!strcmp(a, "--tx-pre")) { c.rc.tx_pre = true; c.rc.pre_floor_hz = (float)atof(v); ++i; }
+        else if (!strcmp(a, "--no-tx-pre")) { c.rc.tx_pre = false; }
+        else if (!strcmp(a, "--pre-gain")) { c.rc.pre_gain_db = (float)atof(v); ++i; }
+        else if (!strcmp(a, "--radio-hp")) { c.rc.pre_radio.hp_hz = atof(v); ++i; }
+        else if (!strcmp(a, "--radio-hp-order")) { c.rc.pre_radio.hp_order = atoi(v); ++i; }
+        else if (!strcmp(a, "--radio-preemph")) { c.rc.pre_radio.preemph_us = atof(v); ++i; }
+        else if (!strcmp(a, "--radio-lp")) { c.rc.pre_radio.lp_hz = atof(v); ++i; }
+        else if (!strcmp(a, "--loop-radio")) { c.rc.loop_radio = true; }
+        else if (!strcmp(a, "--loop-limit")) { c.rc.loop_limit = (float)atof(v); ++i; }
         else if (!strcmp(a, "--relay")) { c.radio = c.gateway = true; }
         else if (!strcmp(a, "--relay-to-radio")) { c.gw_net_to_rf = true; }
         else if (!strcmp(a, "--no-relay-to-net")) { c.gw_rf_to_net = false; }
