@@ -1,6 +1,9 @@
 #include "m17.h"
 
+#include <stdbool.h>
 #include <string.h>
+
+#define M17_HASH_BASE 262144000000000ull   /* 40^9 = 0xEE6B28000000 */
 
 static const char CHARSET[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/.";
 
@@ -32,13 +35,21 @@ void m17_encode_call(const char *call, uint8_t out[6])
         memset(out, 0xFF, 6);
         return;
     }
+    /* "#NAME" (e.g. #PARROT, #BOOT): the spec's hash-address range, 40^9 + the base-40 value of NAME */
+    bool hash = call[0] == '#';
+    if (hash) {
+        ++call;
+    }
     uint64_t v = 0;
     size_t n = strlen(call);
-    if (n > 9) {
-        n = 9;
+    if (n > (hash ? 8u : 9u)) {
+        n = hash ? 8u : 9u;
     }
     for (size_t i = n; i-- > 0;) {                /* the first character is the least significant digit */
         v = v * 40 + (uint64_t)char_value(call[i]);
+    }
+    if (hash) {
+        v += M17_HASH_BASE;
     }
     for (int i = 5; i >= 0; --i) {
         out[i] = (uint8_t)(v & 0xFF);
@@ -57,9 +68,9 @@ void m17_decode_call(const uint8_t in[6], char out[M17_CALL_LEN])
         return;
     }
     int n = 0;
-    if (v >= 262144000000000ull) {                /* 40^9: beyond callsigns (reserved / hash) */
-        strcpy(out, "#");
-        return;
+    if (v >= M17_HASH_BASE) {                     /* 40^9 and up: "#NAME" */
+        v -= M17_HASH_BASE;
+        out[n++] = '#';
     }
     while (v && n < M17_CALL_LEN - 1) {
         out[n++] = CHARSET[v % 40];
