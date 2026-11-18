@@ -46,6 +46,25 @@ void audio_list_devices(void)
     }
 }
 
+bool audio_device_name(int device, char *name, size_t size)
+{
+    UINT id = (UINT)device;
+    if (device < 0) {
+        DWORD pref = 0, flags = 0;
+        if (waveOutMessage((HWAVEOUT)(UINT_PTR)WAVE_MAPPER, 0x2015 /* DRVM_MAPPER_PREFERRED_GET */, (DWORD_PTR)&pref,
+                           (DWORD_PTR)&flags) != MMSYSERR_NOERROR) {
+            return false;
+        }
+        id = (UINT)pref;
+    }
+    WAVEOUTCAPSA caps;
+    if (waveOutGetDevCapsA(id, &caps, sizeof(caps)) != MMSYSERR_NOERROR) {
+        return false;
+    }
+    snprintf(name, size, "%s", caps.szPname);
+    return true;
+}
+
 audio_out_t *audio_open(int device, unsigned prebuffer_ms)
 {
     audio_out_t *a = calloc(1, sizeof(*a));

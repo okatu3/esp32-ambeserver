@@ -634,6 +634,7 @@ static struct {
     int n;                                /* 20 ms frames already in s.payload (0 or 1) */
     unsigned packets;
     double start, next;
+    unsigned under0, eqclip0;             /* radio counters when the transmission started */
     wav_t mic;
 } T;
 
@@ -669,6 +670,8 @@ static void tx_start(double t)
     if (s_radio) {
         uint8_t lsf[M17_LSF_BYTES];
         make_lsf(T.s.dst, T.s.src, T.s.type, lsf);
+        T.under0 = radio_stats(s_radio)->tx_underruns;
+        T.eqclip0 = radio_stats(s_radio)->eq_clips;
         radio_tx_begin(s_radio, lsf);
     }
     T.active = true;
@@ -721,6 +724,15 @@ static void tx_finish(double t)
     T.active = false;
     wav_close(&T.mic);
     logf_("    end of transmission: %.1f s, %u packets", (t - T.start) / 1000.0, T.packets);
+    if (s_radio) {
+        unsigned un = radio_stats(s_radio)->tx_underruns - T.under0, ec = radio_stats(s_radio)->eq_clips - T.eqclip0;
+        if (un) {
+            logf_("[W] the radio output ran dry %u times (the voice frames came too late): gaps in the signal", un);
+        }
+        if (ec) {
+            logf_("[W] the transmit equalizer clipped %u samples (lower tx_eq_gain_db)", ec);
+        }
+    }
     if (s_radio && radio_stats(s_radio)->pre_clips) {
         logf_("[W] TX precompensation clipped %u samples so far: lower the gain after it (--pre-gain)",
               radio_stats(s_radio)->pre_clips);
@@ -1003,6 +1015,16 @@ static DWORD WINAPI run(LPVOID arg)
         return 0;
     }
     s_spk = s_cfg.no_speaker ? NULL : audio_open(s_cfg.spk_device, s_cfg.jitter_ms);
+    if (s_spk && s_cfg.radio && (s_cfg.rc.rx_if || s_cfg.rc.tx_pre)) {
+        /* a radio on USB audio: the received voice must not go into a radio's sound card (with two radios on one PC,
+         * it was mixed into the other station's transmission and broke it into pieces, 2026-11-19) */
+        char sp[128];
+        if (audio_device_name(s_cfg.spk_device, sp, sizeof(sp)) && strstr(sp, "USB Audio CODEC")) {
+            logf_("[W] the received voice plays on \"%s\"%s: that is a radio's sound card, so it is mixed into "
+                  "that radio's transmission. Choose the PC's speaker (spk=N in m17_pc.ini, N from m17_cli -l)",
+                  sp, s_cfg.spk_device < 0 ? " (Windows' default)" : "");
+        }
+    }
     mic_in_t *mic = s_cfg.tx_wav[0] ? NULL : mic_open(s_cfg.mic_device);
     if (s_cfg.tx_wav[0] && !load_wav(s_cfg.tx_wav)) {
         logf_("[E] cannot read %s", s_cfg.tx_wav);

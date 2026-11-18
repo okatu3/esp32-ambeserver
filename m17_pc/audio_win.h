@@ -37,3 +37,5 @@ unsigned audio_queued_ms(const audio_out_t *a);
 const audio_stats_t *audio_stats(const audio_out_t *a);
 /* Prints the output devices (index and name) to stderr. */
 void audio_list_devices(void);
+/* The name of an output device (-1: the one Windows uses as its default). False when it is not known. */
+bool audio_device_name(int device, char *name, size_t size);

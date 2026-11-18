@@ -914,6 +914,7 @@ static void do_connect(void)
     get_a(ID_DEST, c.dest, sizeof(c.dest));
     CharUpperA(c.dest);
     c.mic_device = (int)SendMessageW(ctl(ID_MIC), CB_GETCURSEL, 0, 0) - 1;
+    c.spk_device = (int)GetPrivateProfileIntW(L"m17_pc", L"spk", -1, s_ini);   /* speaker: only in the ini */
     c.tx_gain_db = (float)GetPrivateProfileIntW(L"m17_pc", L"tx_gain_db", 0, s_ini);   /* gains: only in the ini */
     c.rx_gain_db = (float)GetPrivateProfileIntW(L"m17_pc", L"rx_gain_db", 0, s_ini);
     if (SendMessageW(ctl(ID_SAVE), BM_GETCHECK, 0, 0) == BST_CHECKED) {

@@ -5,6 +5,7 @@
  *     --dest CALL        destination of our streams (@ALL)
  *     --time S           stop after S seconds (default: Ctrl+C)
  *     --tx-wav FILE      transmit this WAV (8 kHz mono 16 bit) once, starting --tx-at S seconds after linking
+ *     --tx-mic S         transmit from the microphone (--mic N) for S seconds, starting at --tx-at (tests)
  *     --wav DIR          save received calls            -n            no speaker
  *     --mic N / --spk N  devices (see -l)               --jitter MS   --tx-gain dB   --rx-gain dB
  *   m17_cli parrot CALLSIGN [options]                 (the built-in test reflector on 127.0.0.1:--port, default 17000)
@@ -34,7 +35,7 @@
  *     --test-rf WAV:CALL:S[:DEST]  with --loop: CALL calls DEST on the radio channel S s after the start (tests,
  *                        up to 6 times)
  *   m17_cli -l           list microphones and speakers
- * A transmission is started here only by --tx-wav: this program has no PTT key. */
+ * A transmission is started here only by --tx-wav or --tx-mic: this program has no PTT key. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <signal.h>
@@ -93,7 +94,7 @@ int main(int argc, char **argv)
 {
     me_cfg_t c;
     me_default_cfg(&c);
-    double run_s = 0, tx_at = 3;
+    double run_s = 0, tx_at = 3, tx_mic_s = 0;
     if (argc > 2 && strcmp(argv[1], "--check") == 0) {   /* prints the licence search address (sends nothing) */
         char base[16], url[400];
         license_base_call(argv[2], base);
@@ -138,6 +139,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--time")) { run_s = atof(v); ++i; }
         else if (!strcmp(a, "--tx-wav")) { snprintf(c.tx_wav, sizeof(c.tx_wav), "%s", v); ++i; }
         else if (!strcmp(a, "--tx-at")) { tx_at = atof(v); ++i; }
+        else if (!strcmp(a, "--tx-mic")) { tx_mic_s = atof(v); ++i; }
         else if (!strcmp(a, "--wav")) { snprintf(c.wav_dir, sizeof(c.wav_dir), "%s", v); ++i; }
         else if (!strcmp(a, "-n")) { c.no_speaker = true; }
         else if (!strcmp(a, "--mic")) { c.mic_device = atoi(v); ++i; }
@@ -258,6 +260,16 @@ int main(int argc, char **argv)
         if (c.tx_wav[0] && linked_at && !tx_done && GetTickCount() - linked_at > tx_at * 1000) {
             me_set_ptt(true);                  /* released by the engine when the WAV ends */
             tx_done = true;
+        }
+        if (tx_mic_s > 0 && !c.tx_wav[0] && linked_at && GetTickCount() - linked_at > tx_at * 1000) {
+            bool on = GetTickCount() - linked_at < (tx_at + tx_mic_s) * 1000;
+            if (on != tx_done) {               /* key from the microphone for --tx-mic seconds */
+                me_set_ptt(on);
+                tx_done = on;
+                if (!on) {
+                    tx_mic_s = 0;
+                }
+            }
         }
         if (run_s > 0 && GetTickCount() - t0 > run_s * 1000) {
             break;
