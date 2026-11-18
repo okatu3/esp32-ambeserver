@@ -1,5 +1,5 @@
-/* taikou_eq: see taikou_eq.h. */
-#include "taikou_eq.h"
+/* fm_eq: see fm_eq.h. */
+#include "fm_eq.h"
 
 #include <math.h>
 #include <stdio.h>

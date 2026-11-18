@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "fm_eq.h"
 #include "fm_path.h"
 #include "m17_rf.h"
 
@@ -35,9 +36,18 @@ typedef struct {
     float pre_gain_db;                     /* after the precompensation (e.g. -24): room for the boosted lows */
     bool loop_radio;                       /* RADIO_DEV_LOOP: through a model of such a radio (pre_radio, limiter) */
     float loop_limit;                      /* that model's limiter, x the +3 symbol deviation (1.5) */
+    /* equalizers learned with taikou-test1-1 on two radios (fm_eq.h). The IC-705's FM-D path delays the lows by
+     * 5-12 ms; the magnitude-only precompensation leaves the 4-level eye closed. 2026-11-18, two IC-705s: with
+     * tx_eq (eq_A_tx.txt) a receiver without any equalizer decoded 100 of 100 frames without errors. */
+    char tx_eq[260];                       /* transmit: after the precompensation (empty: none) */
+    float tx_eq_hp_hz;                     /* high-pass before it (25): the radio drops the very lows anyway */
+    float tx_eq_gain_db;                   /* after it (-2): the equalizer lifts the lows and 3.2 kHz */
+    char rx_eq[260];                       /* receive (rx_if): after the discriminator (empty: none) */
 } radio_cfg_t;
 
-void radio_cfg_ic705(radio_cfg_t *c);      /* IC-705 over USB: CI-V A4 115200, IF receive, precompensation (a guess) */
+/* IC-705 over USB: CI-V A4 115200, IF receive, precompensation with the values measured on 2026-11-18 (FM-D,
+ * USB MOD Level 50 %): high-pass 110 Hz order 2, pre-emphasis 5000 us, +3 symbols -47.5 dBFS, +30 dB after it */
+void radio_cfg_ic705(radio_cfg_t *c);
 
 typedef enum { RE_LSF, RE_STREAM, RE_END } radio_evt_kind_t;
 
@@ -56,6 +66,7 @@ typedef struct {
     unsigned tx_underruns;                 /* output ran dry while keyed (the frames came too late) */
     unsigned frames_rx;
     unsigned pre_clips;                    /* samples the precompensation clipped (lower pre_gain_db) */
+    unsigned eq_clips;                     /* samples the transmit equalizer clipped (lower tx_eq_gain_db) */
     float if_offset_hz;                    /* rx_if: frequency error of the received signal */
 } radio_stats_t;
 

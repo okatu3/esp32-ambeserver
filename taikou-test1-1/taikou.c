@@ -32,7 +32,7 @@
 #include "m17.h"
 #include "m17_modem.h"
 #include "m17_rf.h"
-#include "taikou_eq.h"
+#include "fm_eq.h"
 
 #define FS 48000
 #define VERSION "taikou-test1-1 (2026-11-17)"

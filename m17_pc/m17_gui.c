@@ -508,10 +508,20 @@ static void radio_cfg_from_ini(radio_cfg_t *c)
     /* a radio without a data port over USB (IC-705): IF receive and TX precompensation */
     c->rx_if = c->tx_pre = rini(L"usb_radio", 0) != 0;
     c->pre_floor_hz = (float)rini(L"pre_floor_hz", 50);
-    c->pre_gain_db = (float)rini(L"pre_gain_db", -36);
-    c->pre_radio.hp_hz = rini(L"radio_hp_hz", 300);
+    c->pre_gain_db = (float)rini(L"pre_gain_db", 30);
+    /* defaults: the IC-705 FM-D path measured with taikou-test1-1 on 2026-11-18 */
+    c->pre_radio.hp_hz = rini(L"radio_hp_hz", 110);
     c->pre_radio.hp_order = rini(L"radio_hp_order", 2);
-    c->pre_radio.preemph_us = rini(L"radio_preemph_us", 0);
+    c->pre_radio.preemph_us = rini(L"radio_preemph_us", 5000);
+    /* equalizers learned with taikou-test1-1 (eq_A_tx.txt / eq_A.txt): only with the USB radio */
+    wchar_t p[260];
+    GetPrivateProfileStringW(L"radio", L"tx_eq", L"", p, 260, s_ini);
+    WideCharToMultiByte(CP_ACP, 0, p, -1, c->tx_eq, sizeof(c->tx_eq), NULL, NULL);
+    GetPrivateProfileStringW(L"radio", L"rx_eq", L"", p, 260, s_ini);
+    WideCharToMultiByte(CP_ACP, 0, p, -1, c->rx_eq, sizeof(c->rx_eq), NULL, NULL);
+    if (!c->rx_if) {
+        c->tx_eq[0] = c->rx_eq[0] = 0;
+    }
 }
 
 static void wput_int(const wchar_t *key, int v)
@@ -522,7 +532,7 @@ static void wput_int(const wchar_t *key, int v)
 }
 
 enum { RD_IN = 300, RD_OUT, RD_PTT, RD_PORT, RD_ADDR, RD_BAUD, RD_LEVEL, RD_DELAY, RD_INV, RD_N2R, RD_KEEP, RD_CMD,
-       RD_USB, RD_FLOOR, RD_PGAIN };
+       RD_USB, RD_FLOOR, RD_PGAIN, RD_TXEQ, RD_RXEQ };
 static struct {
     HWND wnd;
     bool done, ok;
@@ -590,7 +600,7 @@ static void radio_settings(void)
     }
     radio_cfg_t c;
     radio_cfg_from_ini(&c);
-    RECT pr, r = { 0, 0, S(520), S(602) };
+    RECT pr, r = { 0, 0, S(520), S(662) };
     GetWindowRect(s_wnd, &pr);
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     AdjustWindowRect(&r, style, FALSE);
@@ -652,9 +662,19 @@ static void radio_settings(void)
     swprintf(t, 32, L"%d", (int)c.pre_gain_db);
     HWND pgain = rd_add(L"EDIT", t, WS_TABSTOP, 420, y, 50, 24, RD_PGAIN);
     y += 28;
-    rd_add(L"STATIC", L"受信は 12 kHz の IF、送信は補正。無線機は FM-D、DATA MOD＝USB、USB AF/IF Output＝IF。"
-           L"補正の値は推定です（実測で合わせる）。", SS_LEFT, 30, y, 478, 40, 0);
-    y += 46;
+    rd_add(L"STATIC", L"送信イコライザー", SS_LEFT, 30, y + 3, 120, 20, 0);
+    wchar_t ep[260];
+    MultiByteToWideChar(CP_ACP, 0, c.tx_eq, -1, ep, 260);
+    HWND txeq = rd_add(L"EDIT", ep, ES_AUTOHSCROLL | WS_TABSTOP, 154, y, 354, 24, RD_TXEQ);
+    y += 28;
+    rd_add(L"STATIC", L"受信イコライザー", SS_LEFT, 30, y + 3, 120, 20, 0);
+    MultiByteToWideChar(CP_ACP, 0, c.rx_eq, -1, ep, 260);
+    HWND rxeq = rd_add(L"EDIT", ep, ES_AUTOHSCROLL | WS_TABSTOP, 154, y, 354, 24, RD_RXEQ);
+    y += 28;
+    rd_add(L"STATIC", L"受信は 12 kHz の IF、送信は補正。無線機は FM-D、DATA MOD＝USB、USB AF/IF 出力＝IF。"
+           L"IC-705 の実測値：送信レベル -47、戻す下限 50、補正後 30。イコライザーは taikou-test1-1 で作るファイル"
+           L"（送信 eq_A_tx.txt、受信 eq_A.txt。空欄なら使わない）。", SS_LEFT, 30, y, 478, 56, 0);
+    y += 62;
     rd_add(L"STATIC", L"中継モード：無線機で受けた通話は、いつもリフレクターへ送ります。", SS_LEFT, 12, y, 496, 20, 0);
     y += 24;
     HWND n2r = rd_add(L"BUTTON", L"リフレクターの通話を、無線機から送信する（自動で電波が出ます）", BS_AUTOCHECKBOX | WS_TABSTOP,
@@ -671,7 +691,7 @@ static void radio_settings(void)
     y += 34;
     rd_add(L"STATIC",
            L"マイク端子・スピーカー端子では通りません（300 Hz〜3 kHz の帯域では復調できないことを試験で確認）。"
-           L"USB の IC-705 は、PC の中の模型で確かめただけです。"
+           L"USB の IC-705 は 2026-11-18 に 2 台の対向試験（ダミーロード）で、送信イコライザーを使って受信を確認しました。"
            L"送信の前に、免許の範囲か確かめてください。調整はダミーロードで。",
            SS_LEFT, 12, y, 496, 60, 0);
     y += 70;
@@ -707,7 +727,12 @@ static void radio_settings(void)
         GetWindowTextW(floor_, t, 32);
         wput_int(L"pre_floor_hz", _wtoi(t) < 5 ? 5 : _wtoi(t));
         GetWindowTextW(pgain, t, 32);
-        wput_int(L"pre_gain_db", _wtoi(t) > 0 ? 0 : _wtoi(t));
+        wput_int(L"pre_gain_db", _wtoi(t) > 40 ? 40 : _wtoi(t));   /* +30 for the IC-705 (its pre-emphasis) */
+        wchar_t ep2[260];
+        GetWindowTextW(txeq, ep2, 260);
+        WritePrivateProfileStringW(L"radio", L"tx_eq", ep2, s_ini);
+        GetWindowTextW(rxeq, ep2, 260);
+        WritePrivateProfileStringW(L"radio", L"rx_eq", ep2, s_ini);
         wput_int(L"relay_to_radio", SendMessageW(n2r, BM_GETCHECK, 0, 0) == BST_CHECKED);
         wput_int(L"relay_keep_src", SendMessageW(keep, BM_GETCHECK, 0, 0) == BST_CHECKED);
         wput_int(L"relay_commands", SendMessageW(cmd, BM_GETCHECK, 0, 0) == BST_CHECKED);

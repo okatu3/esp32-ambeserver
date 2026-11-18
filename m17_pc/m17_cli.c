@@ -22,6 +22,10 @@
  *     --pre-gain dB      level after the precompensation (-36)
  *     --radio-hp HZ --radio-hp-order N --radio-preemph US --radio-lp HZ   that path (guess: 300, 2, 0 = none in FM-D, 3000)
  *     --loop-radio       with --loop: through a model of that radio (--loop-limit X, x the +3 symbol, 1.5)
+ *     --tx-eq FILE       transmit equalizer learned with taikou-test1-1 (eq_A_tx.txt; --tx-eq-hp 25, --tx-eq-gain -2)
+ *     --rx-eq FILE       receive equalizer (eq_A.txt), after the IF discriminator
+ *     (--ic705 now sets the measured IC-705 FM-D values: HP 110 Hz order 2, pre-emphasis 5000 us, --tx-level -47.5,
+ *      --pre-gain 30; options after --ic705 override them)
  *   m17_cli HOST CALLSIGN --relay [radio options]    (relay: the radio and a reflector at the same time)
  *     radio -> reflector is on (--no-relay-to-net turns it off); --relay-to-radio also transmits the reflector's
  *     calls on the radio, with our callsign as source (--relay-keep-src: the caller's).
@@ -177,6 +181,10 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--radio-hp-order")) { c.rc.pre_radio.hp_order = atoi(v); ++i; }
         else if (!strcmp(a, "--radio-preemph")) { c.rc.pre_radio.preemph_us = atof(v); ++i; }
         else if (!strcmp(a, "--radio-lp")) { c.rc.pre_radio.lp_hz = atof(v); ++i; }
+        else if (!strcmp(a, "--tx-eq")) { snprintf(c.rc.tx_eq, sizeof(c.rc.tx_eq), "%s", v); ++i; }
+        else if (!strcmp(a, "--tx-eq-gain")) { c.rc.tx_eq_gain_db = (float)atof(v); ++i; }
+        else if (!strcmp(a, "--tx-eq-hp")) { c.rc.tx_eq_hp_hz = (float)atof(v); ++i; }
+        else if (!strcmp(a, "--rx-eq")) { snprintf(c.rc.rx_eq, sizeof(c.rc.rx_eq), "%s", v); ++i; }
         else if (!strcmp(a, "--loop-radio")) { c.rc.loop_radio = true; }
         else if (!strcmp(a, "--loop-limit")) { c.rc.loop_limit = (float)atof(v); ++i; }
         else if (!strcmp(a, "--relay")) { c.radio = c.gateway = true; }

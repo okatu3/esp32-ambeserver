@@ -1,9 +1,9 @@
-/* taikou_eq: a receive / transmit equalizer learned from a known M17 burst.
+/* fm_eq: a receive / transmit equalizer learned from a known M17 burst (taikou-test1-1 learns it, m17_pc uses it).
  * The IC-705 FM-D path (2026-11-18) delays the lows (5-12 ms below 150 Hz) and the 4-level eye closes even after the
  * magnitude-only precompensation. A least-squares FIR (taps every TEQ_STRIDE samples at 48 kHz) learned from the
  * known burst opened it: 99 of 100 frames without errors. */
-#ifndef TAIKOU_EQ_H
-#define TAIKOU_EQ_H
+#ifndef FM_EQ_H
+#define FM_EQ_H
 
 #include <stdbool.h>
 #include <stdint.h>
