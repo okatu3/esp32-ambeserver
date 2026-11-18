@@ -318,6 +318,33 @@ static void get_a(int id, char *out, int size)
 }
 
 /* ---------------------------------------------------------------- log */
+/* every log line also goes to m17_pc_log_YYYYMMDD.txt next to the program (UTF-8): the window keeps only the last
+ * part, and on 2026-11-19 a two-radio QSO could not be analysed afterwards because its log was only on screen */
+static void log_file(const wchar_t *w)
+{
+    static FILE *f;
+    static int day;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    if (!f || day != st.wDay) {
+        if (f) {
+            fclose(f);
+        }
+        wchar_t p[MAX_PATH];
+        swprintf(p, MAX_PATH, L"%ls\\m17_pc_log_%04u%02u%02u.txt", s_dir, st.wYear, st.wMonth, st.wDay);
+        f = _wfopen(p, L"ab");
+        day = st.wDay;
+        if (!f) {
+            return;
+        }
+    }
+    char u[1400];
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof(u), NULL, NULL) > 0) {
+        fputs(u, f);
+        fflush(f);
+    }
+}
+
 static void append_log(const char *line)
 {
     HWND e = ctl(ID_LOG);
@@ -327,6 +354,7 @@ static void append_log(const char *line)
         return;
     }
     wcscat(w, L"\r\n");
+    log_file(w);
     int len = GetWindowTextLengthW(e);
     if (len > 60000) {
         SendMessageW(e, EM_SETSEL, 0, 20000);
@@ -343,6 +371,7 @@ static void append_logw(const wchar_t *text)
     GetLocalTime(&st);
     wchar_t w[700];
     swprintf(w, 700, L"%02u:%02u:%02u  %ls\r\n", st.wHour % 24u, st.wMinute % 60u, st.wSecond % 60u, text);
+    log_file(w);
     HWND e = ctl(ID_LOG);
     int len = GetWindowTextLengthW(e);
     SendMessageW(e, EM_SETSEL, (WPARAM)len, (LPARAM)len);
