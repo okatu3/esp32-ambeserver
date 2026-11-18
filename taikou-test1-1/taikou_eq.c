@@ -123,7 +123,9 @@ static void ls_fir(const float *x, const float *y, int n0, int n1, double *w)
         for (int j = 0; j < i; ++j) R[i][j] = R[j][i];
         tr += R[i][i];
     }
-    for (int i = 0; i < K; ++i) R[i][i] += 1e-4 * tr / K;            /* ridge: keeps the taps tame */
+    const char *rg = getenv("TEQ_RIDGE");                         /* ridge: keeps the taps tame (bigger: gentler) */
+    double ridge = rg ? atof(rg) : 1e-4;
+    for (int i = 0; i < K; ++i) R[i][i] += ridge * tr / K;
     for (int c = 0; c < K; ++c) {
         int p = c;
         for (int r = c + 1; r < K; ++r) if (fabs(R[r][c]) > fabs(R[p][c])) p = r;

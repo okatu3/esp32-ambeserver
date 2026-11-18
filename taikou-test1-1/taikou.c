@@ -1100,6 +1100,56 @@ static void train_and_redo(const opt_t *o, const int16_t *x, int n)
     rx_summary();
 }
 
+/* B4 = the B3 burst (your precompensation) through the equalizer txw (0 dB at 1 kHz).
+ * 2026-11-18: the equalizer lifts the lows and 3.2 kHz, and B4 clipped 62k samples. So the burst is built 20 dB below
+ * --level (the precompensation cannot clip), the peak after the equalizer is measured, and the burst is scaled to
+ * -1 dBFS peak, at most back to --level. The receiver follows the level. */
+static int16_t *make_b4(const opt_t *o, const fmp_radio_t *r, const double *txw, int *n_out)
+{
+    int n;
+    int16_t *x = make_burst(o->call, 4, o->frames, o->level - 20, r, o->floor_hz, o->pre_gain, &n);
+    int m = n + TEQ_TAPS * TEQ_STRIDE / 2;             /* the equalizer delays by half its length: let it ring out */
+    int16_t *y = calloc((size_t)m, 2);
+    /* high-pass 25 Hz (2nd order Butterworth) first: below 20 Hz the precompensation lifts a lot, the equalizer adds
+     * +13 dB more (the receiver's DC block never let it see those), and the radio throws it all away anyway.
+     * That was what used the headroom (B4 at full scale even 20 dB low). */
+    double w0 = tan(M_PI * 25.0 / FS), k1 = M_SQRT2 * w0, k2 = w0 * w0, a0 = 1 + k1 + k2;
+    double b0 = 1 / a0, b1 = -2 / a0, b2 = 1 / a0, a1 = 2 * (k2 - 1) / a0, a2 = (1 - k1 + k2) / a0;
+    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (int i = 0; i < n; ++i) {
+        double v = b0 * x[i] + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = x[i]; y2 = y1; y1 = v;
+        y[i] = (int16_t)lrint(v);
+    }
+    free(x);
+    teq_t q;
+    teq_init(&q, txw);
+    teq_run(&q, y, m);
+    int pk = 1;
+    for (int i = 0; i < m; ++i) {
+        pk = abs(y[i]) > pk ? abs(y[i]) : pk;
+    }
+    double sc = pk < 32767 ? 0.89 * 32767.0 / pk : 1;  /* (a peak at full scale: it clipped already) */
+    if (sc > 10) {
+        sc = 10;
+    }
+    int clip = 0;
+    for (int i = 0; i < m; ++i) {
+        double v = y[i] * sc;
+        clip += v > 32767 || v < -32768;
+        y[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : lrint(v));
+    }
+    if (sc < 10) {
+        printf("  B4 is %.1f dB below --level so the equalizer does not clip (raise USB MOD Level to get it back)\n",
+               -20 * log10(sc / 10));
+    }
+    if (clip) {
+        printf("  [W] burst 4: the equalizer clipped %d samples (lower --level)\n", clip);
+    }
+    *n_out = m;
+    return y;
+}
+
 static int cmd_m17_tx(const opt_t *o)
 {
     if (!o->call[0]) {
@@ -1145,24 +1195,8 @@ static int cmd_m17_tx(const opt_t *o)
     Sleep(3000);
     for (int b = 0; b < nb && !s_stop; ++b) {
         int n;
-        int pb = b == 3 ? 2 : b;                       /* B4: the B3 burst, then the equalizer */
-        int16_t *x = make_burst(o->call, b + 1, o->frames, o->level, plan[pb].r, plan[pb].floor_hz, plan[pb].gain, &n);
-        if (b == 3) {
-            teq_t q;
-            teq_init(&q, txw);
-            int16_t *y = calloc((size_t)n + TEQ_TAPS * TEQ_STRIDE, 2);
-            memcpy(y, x, (size_t)n * 2);
-            int m = n + TEQ_TAPS * TEQ_STRIDE / 2;     /* the equalizer delays by half its length: let it ring out */
-            teq_run(&q, y, m);
-            int clip = 0;
-            for (int i = 0; i < m; ++i) clip += y[i] == 32767 || y[i] == -32768;
-            if (clip) {
-                printf("  [W] burst 4: the equalizer clipped %d samples (lower --level)\n", clip);
-            }
-            free(x);
-            x = y;
-            n = m;
-        }
+        int16_t *x = b == 3 ? make_b4(o, &o->radio, txw, &n)
+                            : make_burst(o->call, b + 1, o->frames, o->level, plan[b].r, plan[b].floor_hz, plan[b].gain, &n);
         printf("B%d ...\n", b + 1);
         transmit(o, x, n);
         free(x);
@@ -1182,6 +1216,15 @@ static int cmd_m17_ref(const opt_t *o)
         snprintf(path, sizeof(path), "ref_B%d.wav", b);
         write_wav(path, x, n);
         printf("wrote %s (%.2f s, +3 symbols at -10 dBFS)\n", path, (double)n / FS);
+        free(x);
+    }
+    double txw[TEQ_TAPS];
+    if (o->tx_eq[0] && o->b3 && teq_load(o->tx_eq, txw)) {          /* the B4 audio exactly as m17-tx sends it */
+        teq_unity_1k(txw);
+        int n;
+        int16_t *x = make_b4(o, &o->radio, txw, &n);
+        write_wav("tx_B4.wav", x, n);
+        printf("wrote tx_B4.wav (B4 as sent, --level %.1f)\n", o->level);
         free(x);
     }
     return 0;
