@@ -10,10 +10,12 @@
 
 #define TEQ_TAPS 161
 #define TEQ_STRIDE 5
+#define TEQ_MAX 481        /* a transmit equalizer after corrections were folded in */
 
 typedef struct {
-    double w[TEQ_TAPS];
-    float hist[TEQ_TAPS * TEQ_STRIDE];
+    int n;
+    double w[TEQ_MAX];
+    float hist[TEQ_MAX * TEQ_STRIDE];
     int hpos;
 } teq_t;
 
@@ -30,11 +32,14 @@ typedef struct {
 bool teq_train(const int16_t *rec, int nrec, const int16_t *ref, int nref, double *w, teq_report_t *rep);
 /* the channel and the equalizer at a few frequencies, relative to 1 kHz (printed) */
 void teq_print_response(const double *w);
-bool teq_save(const char *path, const double *w, const char *note);
-bool teq_load(const char *path, double *w);
-void teq_init(teq_t *q, const double *w);
+bool teq_save(const char *path, const double *w, int nw, const char *note);
+int teq_load(const char *path, double *w);           /* taps (odd, <= TEQ_MAX), 0 if not readable */
+void teq_init(teq_t *q, const double *w, int nw);
 void teq_run(teq_t *q, int16_t *x, int n);          /* in place */
 /* scale w to 0 dB at 1 kHz (for the transmitter: keep the deviation where the level settings put it) */
-void teq_unity_1k(double *w);
+void teq_unity_1k(double *w, int nw);
+/* out = a then b (both FIRs at the same stride), cut to TEQ_TAPS around the middle; returns the energy share cut off.
+ * Used to fold the correction learned from a received B4 into the transmit equalizer that B4 was sent with. */
+int teq_combine(const double *a, int na, const double *b, int nb, double *out, double *cut);
 
 #endif

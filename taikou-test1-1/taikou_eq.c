@@ -188,11 +188,11 @@ bool teq_train(const int16_t *rec, int nrec, const int16_t *ref16, int nref, dou
     return true;
 }
 
-static void resp(const double *w, double f, double *mag, double *gd_ms)
+static void resp(const double *w, int nw, double f, double *mag, double *gd_ms)
 {
     double re = 0, im = 0, re2 = 0, im2 = 0, df = 5;
-    for (int k = 0; k < K; ++k) {
-        double t = (double)ST * (k - K / 2) / FS;
+    for (int k = 0; k < nw; ++k) {
+        double t = (double)ST * (k - nw / 2) / FS;
         re += w[k] * cos(2 * M_PI * f * t); im -= w[k] * sin(2 * M_PI * f * t);
         re2 += w[k] * cos(2 * M_PI * (f + df) * t); im2 -= w[k] * sin(2 * M_PI * (f + df) * t);
     }
@@ -207,61 +207,87 @@ void teq_print_response(const double *w)
 {
     static const double F[] = { 20, 30, 50, 70, 100, 150, 200, 300, 500, 1000, 2000, 2400, 2800, 3200 };
     double m1, g1;
-    resp(w, 1000, &m1, &g1);
+    resp(w, K, 1000, &m1, &g1);
     printf("equalizer (what it adds; the radio's path is the opposite), relative to 1 kHz:\n");
     for (size_t i = 0; i < sizeof(F) / sizeof(F[0]); ++i) {
         double m, g;
-        resp(w, F[i], &m, &g);
+        resp(w, K, F[i], &m, &g);
         printf("  %5.0f Hz  %+6.1f dB  delay %+6.2f ms\n", F[i], 20 * log10(m / m1 + 1e-12), g - g1);
     }
 }
 
-void teq_unity_1k(double *w)
+void teq_unity_1k(double *w, int nw)
 {
     double m, g;
-    resp(w, 1000, &m, &g);
-    for (int k = 0; k < K; ++k) w[k] /= m;
+    resp(w, nw, 1000, &m, &g);
+    for (int k = 0; k < nw; ++k) w[k] /= m;
 }
 
-bool teq_save(const char *path, const double *w, const char *note)
+/* tap k of an n-tap filter sits at offset ST*(k - n/2): a_i b_j lands at ST*(i + j - (na-1)/2 - (nb-1)/2), so the
+ * full product (na+nb-1 taps, odd) is centred the same way. Longer than TEQ_MAX: cut around the middle. */
+int teq_combine(const double *a, int na, const double *b, int nb, double *out, double *cut)
+{
+    int nc = na + nb - 1;
+    double *c = calloc((size_t)nc, sizeof(double)), tot = 0, kept = 0;
+    for (int i = 0; i < na; ++i) {
+        for (int j = 0; j < nb; ++j) {
+            c[i + j] += a[i] * b[j];
+        }
+    }
+    int no = nc > TEQ_MAX ? TEQ_MAX : nc, off = (nc - no) / 2;
+    for (int j = 0; j < nc; ++j) {
+        tot += c[j] * c[j];
+    }
+    for (int k = 0; k < no; ++k) {
+        out[k] = c[k + off];
+        kept += out[k] * out[k];
+    }
+    free(c);
+    *cut = tot > 0 ? 1 - kept / tot : 0;
+    return no;
+}
+
+bool teq_save(const char *path, const double *w, int nw, const char *note)
 {
     FILE *f = fopen(path, "w");
     if (!f) return false;
-    fprintf(f, "# taikou-test1-1 equalizer: %d taps, every %d samples at 48 kHz (%s)\n", K, ST, note);
-    for (int k = 0; k < K; ++k) fprintf(f, "%.9g\n", w[k]);
+    fprintf(f, "# taikou-test1-1 equalizer: %d taps, every %d samples at 48 kHz (%s)\n", nw, ST, note);
+    for (int k = 0; k < nw; ++k) fprintf(f, "%.9g\n", w[k]);
     fclose(f);
     return true;
 }
 
-bool teq_load(const char *path, double *w)
+/* the number of taps (odd, up to TEQ_MAX), or 0 */
+int teq_load(const char *path, double *w)
 {
     FILE *f = fopen(path, "r");
-    if (!f) return false;
+    if (!f) return 0;
     char line[256];
     int k = 0;
-    while (k < K && fgets(line, sizeof(line), f)) {
-        if (line[0] == '#') continue;
+    while (k < TEQ_MAX && fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         w[k++] = atof(line);
     }
     fclose(f);
-    return k == K;
+    return (k >= 3 && (k & 1)) ? k : 0;
 }
 
-void teq_init(teq_t *q, const double *w)
+void teq_init(teq_t *q, const double *w, int nw)
 {
     memset(q, 0, sizeof(*q));
-    memcpy(q->w, w, sizeof(q->w));
+    q->n = nw;
+    memcpy(q->w, w, sizeof(double) * (size_t)nw);
 }
 
-/* y[n] = sum_k w_k x[n - ST*(k - K/2)]: non-causal by K/2*ST samples, so the output is delayed by that much */
+/* y[n] = sum_k w_k x[n - ST*(k - N/2)]: non-causal by ST*N/2 samples, so the output is delayed by that much */
 void teq_run(teq_t *q, int16_t *x, int n)
 {
-    const int H = K * ST;
+    const int H = q->n * ST;
     for (int i = 0; i < n; ++i) {
         q->hist[q->hpos] = x[i];
         double s = 0;
-        for (int k = 0; k < K; ++k) {
-            /* delayed by D = ST*K/2: y[n-D] = sum_k w_k x[n-D - ST*(k-K/2)] = sum_k w_k x[n - ST*k] */
+        for (int k = 0; k < q->n; ++k) {
+            /* delayed by D = ST*N/2: y[n-D] = sum_k w_k x[n-D - ST*(k-N/2)] = sum_k w_k x[n - ST*k] */
             int j = q->hpos - ST * k;
             if (j < 0) j += H;
             s += q->w[k] * q->hist[j];

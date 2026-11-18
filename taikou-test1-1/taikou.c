@@ -57,6 +57,9 @@ typedef struct {
     char train_eq[260];        /* --train-eq FILE: learn the equalizer from burst --train-burst (3) and save it */
     char tx_eq[260];           /* --tx-eq FILE: m17-tx adds B4 = B3 + this equalizer */
     int train_burst;
+    char refine_eq[260];       /* --refine-eq FILE: the transmit equalizer B4 was sent with ... */
+    char refine_out[260];      /* --refine-out FILE: ... learn what is left from the received B4, fold it in, save */
+    double b4_hp;              /* --b4-hp HZ: B4's high-pass before the equalizer (25): the lows cost headroom */
 } opt_t;
 
 static volatile LONG s_stop;
@@ -610,9 +613,18 @@ static int analyze_tones(const int16_t *raw, int n, bool rx_af, double level)
         free(y);
         return 1;
     }
-    /* refine: step back while 1 kHz is still present */
-    while (start > win / 4 && tone_amp(y, start - win / 4, win / 4, 1000) > 0.5 * tone_amp(y, start, win / 4, 1000)) {
-        start -= win / 4;
+    /* refine: step back while 1 kHz is still present AND dominates. 2026-11-18: without the second condition the
+     * discriminator noise before the carrier (its 1 kHz part is large too) pulled the start 0.65 s early, and every
+     * window after it was misplaced (all tones 8 dB low). */
+    for (;;) {
+        int s = start - win / 4, q = win / 4;
+        if (s < 0) break;
+        double a = tone_amp(y, s, q, 1000), mean = 0, e = 0;
+        for (int i = 0; i < q; ++i) mean += y[s + i];
+        mean /= q;
+        for (int i = 0; i < q; ++i) e += (y[s + i] - mean) * (y[s + i] - mean);
+        if (!(a > 0.5 * tone_amp(y, start, q, 1000) && a / sqrt(2.0) > 0.7 * sqrt(e / q))) break;
+        start = s;
     }
     double dev_per_unit = FMP_DEV_HZ / FMP_NOMINAL;
     double t0, len, f, rel;
@@ -1031,6 +1043,8 @@ static void rx_summary(void)
     printf("  (a burst that is not listed was not decoded at all; B1 is expected to fail on a radio with a high-pass)\n");
 }
 
+static int s_eq_n = TEQ_TAPS;    /* taps of the equalizer handed to rx_pipe */
+
 static rxpipe_t *rx_pipe(bool rx_af, const double *eq)
 {
     static rxpipe_t p;
@@ -1042,7 +1056,7 @@ static rxpipe_t *rx_pipe(bool rx_af, const double *eq)
     fmp_ifdem_init(&p.ifd, FMP_IF_HZ);
     if (eq) {
         p.use_eq = true;
-        teq_init(&p.eq, eq);
+        teq_init(&p.eq, eq, s_eq_n);
     }
     return &p;
 }
@@ -1050,11 +1064,11 @@ static rxpipe_t *rx_pipe(bool rx_af, const double *eq)
 /* the receiver's equalizer for this run (--eq), or NULL; with --train-eq the first pass runs without one */
 static const double *rx_eq(const opt_t *o)
 {
-    static double w[TEQ_TAPS];
+    static double w[TEQ_MAX];
     if (!o->eq[0] || o->train_eq[0]) {
         return NULL;
     }
-    if (!teq_load(o->eq, w)) {
+    if (!(s_eq_n = teq_load(o->eq, w))) {
         fprintf(stderr, "cannot read the equalizer %s: receiving without it\n", o->eq);
         return NULL;
     }
@@ -1086,13 +1100,14 @@ static void train_and_redo(const opt_t *o, const int16_t *x, int n)
     teq_print_response(w);
     char note[160];
     snprintf(note, sizeof(note), "from B%d, error %.1f dB -> %.1f dB", o->train_burst, rp.nmse_gain_db, rp.nmse_eq_db);
-    if (!teq_save(o->train_eq, w, note)) {
+    if (!teq_save(o->train_eq, w, TEQ_TAPS, note)) {
         printf("[!] cannot write %s\n", o->train_eq);
         return;
     }
     printf("equalizer saved: %s\n", o->train_eq);
     printf("\n=== the same recording again, with the equalizer\n");
     s_bb_on = false;
+    s_eq_n = TEQ_TAPS;
     rxpipe_t *p = rx_pipe(o->rx_af, w);
     for (int i = 0; i < n; i += 960) {
         rx_block(p, x + i, n - i < 960 ? n - i : 960);
@@ -1104,16 +1119,17 @@ static void train_and_redo(const opt_t *o, const int16_t *x, int n)
  * 2026-11-18: the equalizer lifts the lows and 3.2 kHz, and B4 clipped 62k samples. So the burst is built 20 dB below
  * --level (the precompensation cannot clip), the peak after the equalizer is measured, and the burst is scaled to
  * -1 dBFS peak, at most back to --level. The receiver follows the level. */
-static int16_t *make_b4(const opt_t *o, const fmp_radio_t *r, const double *txw, int *n_out)
+static int16_t *make_b4(const opt_t *o, const fmp_radio_t *r, const double *txw, int ntx, int *n_out)
 {
     int n;
     int16_t *x = make_burst(o->call, 4, o->frames, o->level - 20, r, o->floor_hz, o->pre_gain, &n);
-    int m = n + TEQ_TAPS * TEQ_STRIDE / 2;             /* the equalizer delays by half its length: let it ring out */
+    int m = n + ntx * TEQ_STRIDE / 2;                  /* the equalizer delays by half its length: let it ring out */
     int16_t *y = calloc((size_t)m, 2);
-    /* high-pass 25 Hz (2nd order Butterworth) first: below 20 Hz the precompensation lifts a lot, the equalizer adds
-     * +13 dB more (the receiver's DC block never let it see those), and the radio throws it all away anyway.
-     * That was what used the headroom (B4 at full scale even 20 dB low). */
-    double w0 = tan(M_PI * 25.0 / FS), k1 = M_SQRT2 * w0, k2 = w0 * w0, a0 = 1 + k1 + k2;
+    /* high-pass --b4-hp (25 Hz, 2nd order Butterworth) first: below 20 Hz the precompensation lifts a lot, the
+     * equalizer adds +13 dB more (the receiver's DC block never let it see those), and the radio throws it away
+     * anyway. That used the headroom (B4 at full scale even 20 dB low). 50 Hz keeps more level but removes lows the
+     * demodulator needs; the refining target gets the same high-pass instead (see refine_tx_eq). */
+    double w0 = tan(M_PI * o->b4_hp / FS), k1 = M_SQRT2 * w0, k2 = w0 * w0, a0 = 1 + k1 + k2;
     double b0 = 1 / a0, b1 = -2 / a0, b2 = 1 / a0, a1 = 2 * (k2 - 1) / a0, a2 = (1 - k1 + k2) / a0;
     double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
     for (int i = 0; i < n; ++i) {
@@ -1122,16 +1138,16 @@ static int16_t *make_b4(const opt_t *o, const fmp_radio_t *r, const double *txw,
         y[i] = (int16_t)lrint(v);
     }
     free(x);
-    teq_t q;
-    teq_init(&q, txw);
+    static teq_t q;
+    teq_init(&q, txw, ntx);
     teq_run(&q, y, m);
     int pk = 1;
     for (int i = 0; i < m; ++i) {
         pk = abs(y[i]) > pk ? abs(y[i]) : pk;
     }
     double sc = pk < 32767 ? 0.89 * 32767.0 / pk : 1;  /* (a peak at full scale: it clipped already) */
-    if (sc > 10) {
-        sc = 10;
+    if (sc > 20) {                                     /* at most 6 dB above --level (it was built 20 dB low) */
+        sc = 20;
     }
     int clip = 0;
     for (int i = 0; i < m; ++i) {
@@ -1139,10 +1155,8 @@ static int16_t *make_b4(const opt_t *o, const fmp_radio_t *r, const double *txw,
         clip += v > 32767 || v < -32768;
         y[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : lrint(v));
     }
-    if (sc < 10) {
-        printf("  B4 is %.1f dB below --level so the equalizer does not clip (raise USB MOD Level to get it back)\n",
-               -20 * log10(sc / 10));
-    }
+    printf("  B4 at %+.1f dB from --level (high-pass %.0f Hz; -1 dBFS peak, +6 dB at most)\n", 20 * log10(sc / 10),
+           o->b4_hp);
     if (clip) {
         printf("  [W] burst 4: the equalizer clipped %d samples (lower --level)\n", clip);
     }
@@ -1166,14 +1180,15 @@ static int cmd_m17_tx(const opt_t *o)
                   { &guess, 50, -36, "precompensation, guess (HP 300 Hz order 2, no pre-emphasis, 50 Hz, -36 dB)" },
                   { &o->radio, o->floor_hz, o->pre_gain, "precompensation, your settings" } };
     int nb = o->b3 ? 3 : 2;
-    double txw[TEQ_TAPS];
+    static double txw[TEQ_MAX];
+    int ntx = 0;
     if (o->tx_eq[0]) {
         if (!o->b3) {
             printf("[!] --tx-eq needs the B3 settings (--radio-hp ...): no B4\n");
-        } else if (!teq_load(o->tx_eq, txw)) {
+        } else if (!(ntx = teq_load(o->tx_eq, txw))) {
             printf("[!] cannot read the equalizer %s: no B4\n", o->tx_eq);
         } else {
-            teq_unity_1k(txw);
+            teq_unity_1k(txw, ntx);
             nb = 4;
         }
     }
@@ -1195,7 +1210,7 @@ static int cmd_m17_tx(const opt_t *o)
     Sleep(3000);
     for (int b = 0; b < nb && !s_stop; ++b) {
         int n;
-        int16_t *x = b == 3 ? make_b4(o, &o->radio, txw, &n)
+        int16_t *x = b == 3 ? make_b4(o, &o->radio, txw, ntx, &n)
                             : make_burst(o->call, b + 1, o->frames, o->level, plan[b].r, plan[b].floor_hz, plan[b].gain, &n);
         printf("B%d ...\n", b + 1);
         transmit(o, x, n);
@@ -1218,11 +1233,12 @@ static int cmd_m17_ref(const opt_t *o)
         printf("wrote %s (%.2f s, +3 symbols at -10 dBFS)\n", path, (double)n / FS);
         free(x);
     }
-    double txw[TEQ_TAPS];
-    if (o->tx_eq[0] && o->b3 && teq_load(o->tx_eq, txw)) {          /* the B4 audio exactly as m17-tx sends it */
-        teq_unity_1k(txw);
+    static double txw[TEQ_MAX];
+    int ntx = o->tx_eq[0] && o->b3 ? teq_load(o->tx_eq, txw) : 0;
+    if (ntx) {                                                       /* the B4 audio exactly as m17-tx sends it */
+        teq_unity_1k(txw, ntx);
         int n;
-        int16_t *x = make_b4(o, &o->radio, txw, &n);
+        int16_t *x = make_b4(o, &o->radio, txw, ntx, &n);
         write_wav("tx_B4.wav", x, n);
         printf("wrote tx_B4.wav (B4 as sent, --level %.1f)\n", o->level);
         free(x);
@@ -1230,11 +1246,84 @@ static int cmd_m17_ref(const opt_t *o)
     return 0;
 }
 
+/* --refine-eq: B4 was sent through the transmit equalizer `base` (read at the start, before --train-eq could
+ * overwrite that file). Learn what is still left from the received B4, fold it into base and save --refine-out.
+ * 2026-11-18: the correction learned this way took B4 from 5-8 bad frames to 0 (and it carried over between runs). */
+static double s_refine_base[TEQ_MAX];
+static int s_refine_n;
+static bool s_refine_ok;
+
+static void refine_load(const opt_t *o)
+{
+    s_refine_ok = o->refine_eq[0] && (s_refine_n = teq_load(o->refine_eq, s_refine_base)) > 0;
+    if (o->refine_eq[0] && !s_refine_ok) {
+        printf("[!] REFINE: cannot read %s (the transmit equalizer B4 was sent with)\n", o->refine_eq);
+    }
+}
+
+static void refine_tx_eq(const opt_t *o, const int16_t *x, int n)
+{
+    if (!s_refine_ok) {
+        return;
+    }
+    if (!o->call[0]) {
+        printf("[!] REFINE needs --call (the transmitter's callsign)\n");
+        return;
+    }
+    int nref;
+    int16_t *ref = make_burst(o->call, 4, o->frames, -10, NULL, 0, 1, &nref);
+    /* the target gets the same high-pass B4 is sent with, so the correction does not try to bring back the lows
+     * that are cut on purpose (it did, and the refined B4 came out 8 dB weaker in the band that matters) */
+    {
+        double w0 = tan(M_PI * o->b4_hp / FS), k1 = M_SQRT2 * w0, k2 = w0 * w0, a0 = 1 + k1 + k2;
+        double b0 = 1 / a0, b1 = -2 / a0, b2 = 1 / a0, a1 = 2 * (k2 - 1) / a0, a2 = (1 - k1 + k2) / a0;
+        double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+        for (int i = 0; i < nref; ++i) {
+            double v = b0 * ref[i] + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1; x1 = ref[i]; y2 = y1; y1 = v;
+            ref[i] = (int16_t)lrint(v);
+        }
+    }
+    static double w2[TEQ_TAPS], w[TEQ_MAX];
+    teq_report_t rp;
+    printf("\n=== refining the transmit equalizer from the received B4\n");
+    bool ok = teq_train(s_bb, s_bb_n, ref, nref, w2, &rp);
+    free(ref);
+    printf("  B4 found at %.2f s (match %.2f), clock difference %+.1f ppm\n", rp.pos_s, rp.peak, rp.drift_ppm);
+    if (!ok) {
+        printf("[!] REFINE: B4 was not found in the recording: the transmit equalizer is unchanged\n");
+        return;
+    }
+    printf("  what is left in B4: error %.1f dB with a gain only, %.1f dB after the correction (other half: %.1f dB)\n",
+           rp.nmse_gain_db, rp.nmse_eq_db, rp.nmse_half_db);
+    double cut;
+    int nw = teq_combine(s_refine_base, s_refine_n, w2, TEQ_TAPS, w, &cut);
+    teq_unity_1k(w, nw);
+    printf("  folded into %s: %d taps (%.2f %% of the energy cut off)\n", o->refine_eq, nw, 100 * cut);
+    char note[640];
+    snprintf(note, sizeof(note), "transmit: %s refined from B4 (left %.1f dB -> %.1f dB)", o->refine_eq,
+             rp.nmse_gain_db, rp.nmse_eq_db);
+    if (!teq_save(o->refine_out, w, nw, note)) {
+        printf("[!] cannot write %s\n", o->refine_out);
+        return;
+    }
+    printf("transmit equalizer saved: %s\n", o->refine_out);
+    printf("\n=== B4 of this recording with the correction on receive (what the refined B4 should give)\n");
+    s_bb_on = false;
+    s_eq_n = TEQ_TAPS;
+    rxpipe_t *p = rx_pipe(o->rx_af, w2);
+    for (int i = 0; i < n; i += 960) {
+        rx_block(p, x + i, n - i < 960 ? n - i : 960);
+    }
+    rx_summary();
+}
+
 static int cmd_m17_rx(const opt_t *o)
 {
     printf("receiving %.0f s from input %d (%s): start m17-tx on the other radio (Ctrl+C ends early)\n", o->sec, o->in,
            o->rx_af ? "audio" : "12 kHz IF");
-    s_bb_on = s_bb_path || o->train_eq[0];
+    refine_load(o);
+    s_bb_on = s_bb_path || o->train_eq[0] || s_refine_ok;
     rxpipe_t *p = rx_pipe(o->rx_af, rx_eq(o));
     int n = 0;
     int16_t *x = record(o, o->sec, &n, rx_block, p);
@@ -1246,6 +1335,7 @@ static int cmd_m17_rx(const opt_t *o)
     if (o->train_eq[0]) {
         train_and_redo(o, x, n);
     }
+    refine_tx_eq(o, x, n);
     free(x);
     return 0;
 }
@@ -1262,7 +1352,8 @@ static int cmd_analyze(const char *what, const char *path, const opt_t *o)
     if (!strcmp(what, "tones")) {
         r = analyze_tones(x, n, o->rx_af, o->level);
     } else {
-        s_bb_on = s_bb_path || o->train_eq[0];
+        refine_load(o);
+        s_bb_on = s_bb_path || o->train_eq[0] || s_refine_ok;
         rxpipe_t *p = rx_pipe(o->rx_af, rx_eq(o));
         for (int i = 0; i < n; i += 960) {
             rx_block(p, x + i, n - i < 960 ? n - i : 960);
@@ -1271,6 +1362,7 @@ static int cmd_analyze(const char *what, const char *path, const opt_t *o)
         if (o->train_eq[0]) {
             train_and_redo(o, x, n);
         }
+        refine_tx_eq(o, x, n);
     }
     free(x);
     return r;
@@ -1383,6 +1475,7 @@ int main(int argc, char **argv)
     o.sec = 60;
     o.frames = 100;
     o.train_burst = 3;
+    o.b4_hp = 25;              /* 50 lost lows the demodulator needs (21 bad frames); 25 + refining gave 0 */
     fmp_radio_ic705_guess(&o.radio);
     o.floor_hz = 50;
     o.pre_gain = -36;
@@ -1414,6 +1507,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--eq")) { snprintf(o.eq, sizeof(o.eq), "%s", v); ++i; }
         else if (!strcmp(a, "--train-eq")) { snprintf(o.train_eq, sizeof(o.train_eq), "%s", v); ++i; }
         else if (!strcmp(a, "--tx-eq")) { snprintf(o.tx_eq, sizeof(o.tx_eq), "%s", v); ++i; }
+        else if (!strcmp(a, "--b4-hp")) { o.b4_hp = atof(v); ++i; }
+        else if (!strcmp(a, "--refine-eq")) { snprintf(o.refine_eq, sizeof(o.refine_eq), "%s", v); ++i; }
+        else if (!strcmp(a, "--refine-out")) { snprintf(o.refine_out, sizeof(o.refine_out), "%s", v); ++i; }
         else if (!strcmp(a, "--train-burst")) { o.train_burst = atoi(v); ++i; }
         else if (!strcmp(a, "--rx-gain")) { s_rx_gain = pow(10, atof(v) / 20); ++i; }
         else if (!strcmp(a, "--tx-delay")) { o.tx_delay_ms = (unsigned)atoi(v); ++i; }

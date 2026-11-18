@@ -28,7 +28,7 @@ enum {
     ID_IN = 101, ID_OUT, ID_COM, ID_REFRESH, ID_CALL, ID_SEC, ID_TAG, ID_RXAF,
     ID_IFCHECK, ID_TONESRX, ID_M17RX, ID_STOPRX, ID_SELFTEST, ID_ANALYZE,
     ID_CIV, ID_TONESTX, ID_M17TX, ID_STOPTX,
-    ID_HP, ID_ORDER, ID_PRE, ID_FLOOR, ID_GAIN, ID_LEVEL, ID_TLEVEL, ID_TRAINEQ, ID_USEEQ, ID_TXEQ,
+    ID_HP, ID_ORDER, ID_PRE, ID_FLOOR, ID_GAIN, ID_LEVEL, ID_TLEVEL, ID_TRAINEQ, ID_USEEQ, ID_TXEQ, ID_REFINE,
     ID_OUTRX, ID_OUTTX, ID_LBLRX, ID_LBLTX, ID_HINT
 };
 
@@ -152,8 +152,9 @@ static void load_settings(void)
         SetWindowTextW(C(EDITS[i].id), v);
     }
     SendMessageW(C(ID_RXAF), BM_SETCHECK, GetPrivateProfileIntW(L"taikou", L"rx_af", 0, g_ini) ? BST_CHECKED : BST_UNCHECKED, 0);
-    static const struct { int id; const wchar_t *key; } CB[] = { { ID_TRAINEQ, L"train_eq" }, { ID_USEEQ, L"use_eq" }, { ID_TXEQ, L"tx_eq" } };
-    for (size_t i = 0; i < 3; ++i)
+    static const struct { int id; const wchar_t *key; } CB[] = { { ID_TRAINEQ, L"train_eq" }, { ID_USEEQ, L"use_eq" }, { ID_TXEQ, L"tx_eq" },
+                                                                 { ID_REFINE, L"refine_eq" } };
+    for (size_t i = 0; i < 4; ++i)
         SendMessageW(C(CB[i].id), BM_SETCHECK, GetPrivateProfileIntW(L"taikou", CB[i].key, 0, g_ini) ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
@@ -176,6 +177,16 @@ static void eq_path(wchar_t *out, int n)
     swprintf(out, n, L"%ls\\eq_%ls.txt", g_dir, tag[0] ? tag : L"A");
 }
 
+/* the transmit equalizer for B4: eq_<記録名>_tx.txt (refined from a received B4) if there is one, else eq_<記録名>.txt */
+static void tx_eq_path(wchar_t *out, int n, bool *refined)
+{
+    wchar_t tag[32];
+    GetWindowTextW(C(ID_TAG), tag, 32);
+    swprintf(out, n, L"%ls\\eq_%ls_tx.txt", g_dir, tag[0] ? tag : L"A");
+    *refined = GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES;
+    if (!*refined) eq_path(out, n);
+}
+
 /* receiver side: learn (needs the transmitter's callsign: it is part of the burst) or use the equalizer */
 static void rx_eq_opts(wchar_t *a)
 {
@@ -187,6 +198,15 @@ static void rx_eq_opts(wchar_t *a)
         swprintf(a + l, 1024 - l, L" --train-eq \"%ls\" --call %ls", e, call[0] ? call : L"N0CALL");
     } else if (checked(ID_USEEQ)) {
         swprintf(a + l, 1024 - l, L" --eq \"%ls\"", e);
+    }
+    if (checked(ID_REFINE)) {                /* learn what is left in the received B4 and fold it into the TX equalizer */
+        wchar_t base[MAX_PATH], out[MAX_PATH], tag[32];
+        bool refined;
+        tx_eq_path(base, MAX_PATH, &refined);
+        GetWindowTextW(C(ID_TAG), tag, 32);
+        swprintf(out, MAX_PATH, L"%ls\\eq_%ls_tx.txt", g_dir, tag[0] ? tag : L"A");
+        l = wcslen(a);
+        swprintf(a + l, 1024 - l, L" --refine-eq \"%ls\" --refine-out \"%ls\" --call %ls", base, out, call[0] ? call : L"N0CALL");
     }
 }
 
@@ -207,6 +227,7 @@ static void save_settings(void)
     WritePrivateProfileStringW(L"taikou", L"train_eq", checked(ID_TRAINEQ) ? L"1" : L"0", g_ini);
     WritePrivateProfileStringW(L"taikou", L"use_eq", checked(ID_USEEQ) ? L"1" : L"0", g_ini);
     WritePrivateProfileStringW(L"taikou", L"tx_eq", checked(ID_TXEQ) ? L"1" : L"0", g_ini);
+    WritePrivateProfileStringW(L"taikou", L"refine_eq", checked(ID_REFINE) ? L"1" : L"0", g_ini);
 }
 
 /* ---------------------------------------------------------------- running taikou-test1-1 */
@@ -544,7 +565,8 @@ static void on_button(int id)
         }
         if (checked(ID_TXEQ)) {
             wchar_t e[MAX_PATH];
-            eq_path(e, MAX_PATH);
+            bool refined;
+            tx_eq_path(e, MAX_PATH, &refined);
             if (GetFileAttributesW(e) == INVALID_FILE_ATTRIBUTES) {
                 MessageBoxW(g_wnd, L"イコライザーのファイル（eq_<記録名>.txt）がまだありません。\n"
                                    L"受信側で「B3 から EQ を作る」にして ④ を受信すると作られます（2 台の PC なら、送信側の PC にコピー）。",
@@ -583,6 +605,8 @@ static void scan_line(int slot, const wchar_t *s)
         { L"no answer from CI-V", L"→ この COM は返事がありません。別の COM を選ぶか、CI-V の設定（115200 bps、アドレス A4、"
                                   L"USB Echo Back OFF）を確かめてください。" },
         { L"no CI-V answer", L"→ 送信しませんでした。COM が送信側の無線機か、CI-V の設定を確かめてください。" },
+        { L"transmit equalizer saved:", L"→ 送信用のイコライザー（eq_<記録名>_tx.txt）を直しました。次の ④ の B4 から使われます。" },
+        { L"[!] REFINE", L"→ 送信用のイコライザーを直せませんでした。B4 が録音に入っているか、コールサインを確かめてください。" },
         { L"equalizer saved:", L"→ イコライザーを保存しました。次からは「EQ で受信」で受けられます。送信側で「B4」を付けると、送信にも掛けます。" },
         { L"[!] EQ:", L"→ B3 が録音の中に見つからず、イコライザーを作れませんでした。送信側のコールサインと、④ の送信が録音に入っているかを確かめてください。" },
         { L"[!] LIMITER", L"→ 送信の音が大きすぎて、偏移のリミッターで頭打ちです。上の周波数特性は正しくありません。"
@@ -668,8 +692,9 @@ static void create_controls(void)
     BTN(L"止める", 390, 110, 90, ID_STOPRX);
     BTN(L"① 自己試験", 12, 144, 110, ID_SELFTEST);
     BTN(L"WAV を解析…", 128, 144, 130, ID_ANALYZE);
-    mk(L"BUTTON", L"B3 から EQ を作る", BS_AUTOCHECKBOX | WS_TABSTOP, 270, 147, 150, 22, ID_TRAINEQ, NULL);
-    mk(L"BUTTON", L"EQ で受信", BS_AUTOCHECKBOX | WS_TABSTOP, 425, 147, 120, 22, ID_USEEQ, NULL);
+    mk(L"BUTTON", L"B3 で EQ を作る", BS_AUTOCHECKBOX | WS_TABSTOP, 266, 147, 128, 22, ID_TRAINEQ, NULL);
+    mk(L"BUTTON", L"EQ で受信", BS_AUTOCHECKBOX | WS_TABSTOP, 396, 147, 92, 22, ID_USEEQ, NULL);
+    mk(L"BUTTON", L"B4 で直す", BS_AUTOCHECKBOX | WS_TABSTOP, 490, 147, 96, 22, ID_REFINE, NULL);
 
     /* right: transmitter A */
     mk(L"STATIC", L"送信側（A）　ダミーロード・最小出力", SS_LEFT, 600, 12, 560, 22, -1, g_bold);
