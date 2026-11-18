@@ -7,6 +7,9 @@ cd /d "%~dp0.."
 if not exist build_taikou mkdir build_taikou
 gcc -O2 -Wall -Wextra -Wno-unused-parameter -D_USE_MATH_DEFINES ^
     -I m17_modem\core -I m17_pc ^
-    taikou-test1-1\taikou.c m17_modem\core\m17_rf.c m17_modem\core\m17_modem.c m17_pc\m17.c m17_pc\fm_path.c ^
+    taikou-test1-1\taikou.c taikou-test1-1\taikou_eq.c m17_modem\core\m17_rf.c m17_modem\core\m17_modem.c m17_pc\m17.c m17_pc\fm_path.c ^
     -lwinmm -lm -static -o build_taikou\taikou-test1-1.exe || exit /b 1
 echo Built build_taikou\taikou-test1-1.exe
+gcc -O2 -Wall -Wextra -Wno-unused-parameter taikou-test1-1\taikou_gui.c ^
+    -mwindows -lwinmm -lcomdlg32 -lgdi32 -static -o build_taikou\taikou-gui.exe || exit /b 1
+echo Built build_taikou\taikou-gui.exe (window; needs taikou-test1-1.exe in the same folder)

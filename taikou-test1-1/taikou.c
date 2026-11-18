@@ -32,6 +32,7 @@
 #include "m17.h"
 #include "m17_modem.h"
 #include "m17_rf.h"
+#include "taikou_eq.h"
 
 #define FS 48000
 #define VERSION "taikou-test1-1 (2026-11-17)"
@@ -52,6 +53,10 @@ typedef struct {
     fmp_radio_t radio;         /* B3 precompensation */
     double floor_hz, pre_gain;
     bool b3;
+    char eq[260];              /* --eq FILE: equalize the receiver with it */
+    char train_eq[260];        /* --train-eq FILE: learn the equalizer from burst --train-burst (3) and save it */
+    char tx_eq[260];           /* --tx-eq FILE: m17-tx adds B4 = B3 + this equalizer */
+    int train_burst;
 } opt_t;
 
 static volatile LONG s_stop;
@@ -174,6 +179,14 @@ static void at_exit(void)
     ptt(false);
 }
 
+/* taikou-gui: the window cannot send Ctrl+C to a hidden console, so it sets a named event instead */
+static DWORD WINAPI stop_watch(LPVOID h)
+{
+    WaitForSingleObject((HANDLE)h, INFINITE);
+    on_ctrl(0);
+    return 0;
+}
+
 static unsigned bcd(uint8_t b)
 {
     return (b >> 4) * 10u + (b & 15u);
@@ -205,9 +218,13 @@ static int cmd_civ(const opt_t *o)
     if (n >= 1) {
         printf("    mode %s (%02X), filter %d\n", b[0] < 0x18 && mn[b[0]] ? mn[b[0]] : "?", b[0], n > 1 ? b[1] : 0);
     }
+    bool fm = n >= 1 && b[0] == 0x05;
     n = civ_query(c1a06, 2, b, sizeof(b));
     if (n >= 1) {
         printf("    data mode %s\n", b[0] ? "ON (-D)" : "off");
+    }
+    if (!fm || n < 1 || !b[0]) {
+        printf("    [!] not FM-D: for this test press FM, then DATA (FM-D). tones-tx / m17-tx refuse other modes.\n");
     }
     n = civ_query(c140a, 2, b, sizeof(b));
     if (n >= 2) {
@@ -548,6 +565,8 @@ static double tone_amp(const int16_t *y, int s0, int m, double f)
 }
 
 /* model of the radio's TX audio path magnitude (analog), for the fit */
+static int s_lp_pow = 8;   /* 8: a gentle low-pass, 32: a wall like the IC-705 (both are tried in the fit) */
+
 static double model_db(double f, double hp, int order, double pre_us, double lp)
 {
     double g = 1;
@@ -560,7 +579,7 @@ static double model_db(double f, double hp, int order, double pre_us, double lp)
         g *= sqrt(1 + w * w * t1 * t1) / sqrt(1 + w * w * t2 * t2);
     }
     if (lp > 0) {
-        g /= sqrt(1 + pow(f / lp, 8));
+        g /= sqrt(1 + pow(f / lp, s_lp_pow));      /* the IC-705 cuts like a wall: 3 kHz +8 dB, 3.5 kHz -33 dB (2026-11-18) */
     }
     return 20 * log10(g + 1e-12);
 }
@@ -571,9 +590,14 @@ static int analyze_tones(const int16_t *raw, int n, bool rx_af, double level)
     /* the reference: first 0.1 s window where 1 kHz dominates and is strong */
     int win = FS / 10, start = -1;
     for (int s = 0; s + win <= n; s += win / 2) {
-        double a = tone_amp(y, s, win, 1000), e = 0;
+        /* means removed: the two radios are ~1 kHz apart (2026-11-18: -960 Hz), which is a DC on the deviation */
+        double a = tone_amp(y, s, win, 1000), e = 0, mean = 0;
         for (int i = 0; i < win; ++i) {
-            e += (double)y[s + i] * y[s + i];
+            mean += y[s + i];
+        }
+        mean /= win;
+        for (int i = 0; i < win; ++i) {
+            e += (y[s + i] - mean) * (y[s + i] - mean);
         }
         double rms = sqrt(e / win);
         if (a > 300 && a / sqrt(2.0) > 0.7 * rms) {
@@ -611,25 +635,52 @@ static int analyze_tones(const int16_t *raw, int n, bool rx_af, double level)
     for (int i = 0; i < NTONES; ++i) {
         double a = amp[1 + i];
         meas[i] = a > 0 ? 20 * log10(a / ref + 1e-9) : -99;
-        use[i] = a > 0 && meas[i] > -40;
+        use[i] = a > 0 && meas[i] > -40 && !(TONES[i] > 3000 && meas[i] < -20);   /* the wall above 3 kHz: not fitted */
         printf("  %6.0f Hz  %7.1f dB  (%5.0f Hz dev)%s\n", TONES[i], meas[i], a, use[i] ? "" : "  (too weak, not fitted)");
     }
     printf("\nlevel steps at 1 kHz (deviation should grow 6 dB per step until the limiter):\n");
+    double dmax = 0;
     for (int i = 0; i < NLEVELS; ++i) {
         double a = amp[1 + NTONES + i];
         double expect = ref * pow(10, LEVELS[i] / 20);
         printf("  %+5.0f dB (%.1f dBFS%s)  %6.0f Hz  (linear would be %6.0f Hz, %+.1f dB)\n", LEVELS[i], level + LEVELS[i],
                level + LEVELS[i] > -0.3 ? ", clipped at the sound card" : "", a, expect,
                a > 0 ? 20 * log10(a / expect) : -99);
+        if (a > dmax) {
+            dmax = a;
+        }
+    }
+    /* deviation per full scale from the lowest step (the linear part), not from the reference: on 2026-11-18 the
+     * reference was 14 dB into the IC-705's deviation limiter, which flattened the whole response table */
+    double low = amp[1 + NTONES], low_db = level + LEVELS[0];
+    double dev_fs = low > 0 ? low / pow(10, low_db / 20) : ref / pow(10, level / 20);
+    double ex = low > 0 ? 20 * log10(low / (ref * pow(10, LEVELS[0] / 20))) : 0;
+    if (ex > 2) {
+        double l_ok = 20 * log10(1000.0 / dev_fs);     /* reference at about 1 kHz deviation */
+        printf("\n[!] LIMITER: the reference is already %.0f dB into the transmitter's deviation limiter (about %.0f Hz peak).\n"
+               "    The frequency response above is flattened by the limiter and is NOT valid, so no filter is fitted.\n"
+               "    Deviation per full scale (from the lowest step): %.0f Hz.\n",
+               ex, dmax, dev_fs);
+        printf("for tones-tx: --level %.1f\n", l_ok);
+        double m = 20 * log10(2400.0 / dev_fs);
+        printf("for m17-tx (levels): --level %.1f --pre-gain 0\n", m);
+        printf("    (repeat tones-tx / tones-rx with that level to measure the filters)\n");
+        free(y);
+        return 0;
     }
     /* fit */
     double best = 1e30, bh = 0, bp = 0, bl = 0, bo = 0;
     int border = 0;
-    static const double PRE[] = { 0, 50, 75, 150, 300, 530, 750 };
+    /* up to 5000 us: the IC-705 FM-D rises ~6 dB/octave from 100 Hz to 3 kHz (2026-11-18) */
+    static const double PRE[] = { 0, 50, 75, 150, 300, 530, 750, 1000, 1500, 2000, 3000, 5000 };
+    const int NPRE = (int)(sizeof(PRE) / sizeof(PRE[0]));
+    int blp = 8;
+    for (int lpw = 8; lpw <= 32; lpw += 24) {
+    s_lp_pow = lpw;
     for (int order = 1; order <= 2; ++order) {
         for (double hp = 0; hp <= 800; hp += (hp < 100 ? 5 : 10)) {
-            for (int pi = 0; pi < 7; ++pi) {
-                for (double lp = 2500; lp <= 6000; lp += 250) {
+            for (int pi = 0; pi < NPRE; ++pi) {
+                for (double lp = 2500; lp <= 6000; lp += 100) {
                     double sum = 0, cnt = 0, d[NTONES];
                     for (int i = 0; i < NTONES; ++i) {
                         d[i] = meas[i] - (model_db(TONES[i], hp, order, PRE[pi], lp) - model_db(1000, hp, order, PRE[pi], lp));
@@ -651,11 +702,14 @@ static int analyze_tones(const int16_t *raw, int n, bool rx_af, double level)
                         bp = PRE[pi];
                         bl = lp;
                         bo = off;
+                        blp = lpw;
                     }
                 }
             }
         }
     }
+    }
+    s_lp_pow = blp;
     int nu = 0;
     for (int i = 0; i < NTONES; ++i) {
         nu += use[i];
@@ -675,12 +729,23 @@ static int analyze_tones(const int16_t *raw, int n, bool rx_af, double level)
     printf("for m17-tx (burst B3):               --radio-hp %.0f --radio-hp-order %d --radio-preemph %.0f\n", bh, border,
            bp);
     /* level advice: deviation per full scale (linear part) */
-    double dev_fs = ref / pow(10, level / 20);
-    printf("\ndeviation per full scale (1 kHz): %.0f Hz. M17 wants 2400 Hz for a +3 symbol.\n", dev_fs);
+    printf("\ndeviation per full scale (1 kHz): %.0f Hz, largest step %.0f Hz. M17 wants 2400 Hz for a +3 symbol.\n",
+           dev_fs, dmax);
     double need_db = 20 * log10(2400.0 / dev_fs);
-    printf("  without precompensation: --level %.1f\n", need_db);
-    printf("  with precompensation (gain -36 dB): the +3 symbols would need %.1f dBFS%s\n", need_db + 36,
-           need_db + 36 > -3 ? "  -> too loud: raise USB MOD Level, or use a smaller --pre-gain with a higher floor" : "");
+    /* B1 uses --level as it is, B2/B3 add --pre-gain. The de-emphasis in the precompensation is 1 at DC, so with a
+     * pre-emphasis it takes away its gain at 1 kHz (IC-705 FM-D, 2026-11-18: ~30 dB), which --pre-gain gives back. */
+    double emph_db = model_db(1000, 0, 1, bp, 0);
+    double boost = bh > 50 ? 20 * border * log10(bh / 50.0) : 0;   /* precompensation at the 50 Hz floor */
+    double lv = need_db, top = -4 - emph_db - boost;             /* keep 4 dB for the RRC overshoot */
+    if (lv > top) {
+        lv = top;
+    }
+    printf("  B3: +3 symbols at %.1f dBFS, --pre-gain %.0f dB (gives back the pre-emphasis), low tones lifted by up to %.0f dB",
+           lv, emph_db, boost);
+    if (lv < need_db - 0.5) {
+        printf("\n      that is %.1f dB below the 2400 Hz B1 needs (sound-card headroom): raise USB MOD Level on the transmitter for more room", need_db - lv);
+    }
+    printf("\nfor m17-tx (levels): --level %.1f --pre-gain %.0f\n", lv, emph_db);
     free(y);
     return 0;
 }
@@ -851,7 +916,28 @@ static void on_frame(void *ctx, const m17_sync_info_t *in, const uint16_t *soft)
         printf("stream without LSF (joined late)\n");
     }
     if (s->cur < 1 || s->cur > 9) {
-        return;
+        /* no LSF (a steep cut below ~60 Hz loses it first, 2026-11-18): find the burst from the known payload */
+        int best = -1, bbe = 129;
+        for (int c = 1; c <= 4; ++c) {
+            uint8_t q[16];
+            pattern(c, r.fn, q);
+            int e = 0;
+            for (int i = 0; i < 16; ++i) {
+                e += __builtin_popcount((unsigned)(q[i] ^ r.payload[i]));
+            }
+            if (e < bbe) {
+                bbe = e;
+                best = c;
+            }
+        }
+        if (bbe > 40) {
+            return;                                  /* not one of ours, or too broken to tell */
+        }
+        s->cur = best;
+        printf("  -> burst B%d found from the payload (frame %u, no LSF)\n", best, r.fn);
+        if (best > s->nb) {
+            s->nb = best;
+        }
     }
     typeof(s->b[0]) *b = &s->b[s->cur];
     uint8_t p[16];
@@ -871,21 +957,52 @@ typedef struct {
     m17_demod_t dem;
     fmp_ifdem_t ifd;
     bool rx_af;
+    double dc;                 /* slow DC block: the two radios are ~1 kHz apart (2026-11-18: -950 Hz) */
+    bool use_eq;
+    teq_t eq;                  /* --eq FILE: the equalizer learned by --train-eq */
 } rxpipe_t;
 
 static rxst_t s_rx;
+static double s_rx_gain = 1;   /* --rx-gain DB: scales the demodulated signal (low deviation, 2026-11-18) */
+static int16_t *s_bb; static int s_bb_n, s_bb_cap;   /* the demodulated baseband: --bb FILE, and for --train-eq */
+static const char *s_bb_path;
+static bool s_bb_on;
+
+static void bb_keep(const int16_t *t, int k)
+{
+    if (!s_bb_on) {
+        return;
+    }
+    if (s_bb_n + k > s_bb_cap) {
+        s_bb_cap = (s_bb_n + k) * 2;
+        s_bb = realloc(s_bb, (size_t)s_bb_cap * 2);
+    }
+    memcpy(s_bb + s_bb_n, t, (size_t)k * 2);
+    s_bb_n += k;
+}
 
 static void rx_block(void *ctx, const int16_t *x, int n)
 {
     rxpipe_t *p = ctx;
     int16_t t[960];
-    if (p->rx_af) {
-        m17_demod_push(&p->dem, x, n);
-        return;
-    }
     while (n > 0) {
         int k = n > 960 ? 960 : n;
-        fmp_ifdem_run(&p->ifd, x, t, k);
+        if (p->rx_af) {
+            memcpy(t, x, (size_t)k * 2);
+        } else {
+            fmp_ifdem_run(&p->ifd, x, t, k);
+            /* the demodulator refuses a sync when the DC is over 3x the signal: with a low deviation the offset
+             * between the radios alone did that. tau 0.1 s (1.6 Hz) is far below what M17 needs. */
+            for (int i = 0; i < k; ++i) {
+                p->dc += (t[i] - p->dc) / 4800.0;
+                double v = (t[i] - p->dc) * s_rx_gain;
+                t[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+            }
+        }
+        bb_keep(t, k);
+        if (p->use_eq) {
+            teq_run(&p->eq, t, k);
+        }
         m17_demod_push(&p->dem, t, k);
         x += k;
         n -= k;
@@ -894,8 +1011,11 @@ static void rx_block(void *ctx, const int16_t *x, int n)
 
 static void rx_summary(void)
 {
+    if (s_bb_path && s_bb_n) {
+        write_wav(s_bb_path, s_bb, s_bb_n);
+    }
     rx_end(&s_rx, "");
-    printf("\nsummary (B1 = no precompensation, B2 = guess, B3 = your settings):\n");
+    printf("\nsummary (B1 = no precompensation, B2 = guess, B3 = your settings, B4 = B3 + equalizer):\n");
     for (int b = 1; b <= 9; ++b) {
         typeof(s_rx.b[0]) *r = &s_rx.b[b];
         if (!r->lsf_ok && !r->frames) {
@@ -911,7 +1031,7 @@ static void rx_summary(void)
     printf("  (a burst that is not listed was not decoded at all; B1 is expected to fail on a radio with a high-pass)\n");
 }
 
-static rxpipe_t *rx_pipe(bool rx_af)
+static rxpipe_t *rx_pipe(bool rx_af, const double *eq)
 {
     static rxpipe_t p;
     memset(&p, 0, sizeof(p));
@@ -920,7 +1040,64 @@ static rxpipe_t *rx_pipe(bool rx_af)
     p.rx_af = rx_af;
     m17_demod_init(&p.dem, on_frame, &s_rx);
     fmp_ifdem_init(&p.ifd, FMP_IF_HZ);
+    if (eq) {
+        p.use_eq = true;
+        teq_init(&p.eq, eq);
+    }
     return &p;
+}
+
+/* the receiver's equalizer for this run (--eq), or NULL; with --train-eq the first pass runs without one */
+static const double *rx_eq(const opt_t *o)
+{
+    static double w[TEQ_TAPS];
+    if (!o->eq[0] || o->train_eq[0]) {
+        return NULL;
+    }
+    if (!teq_load(o->eq, w)) {
+        fprintf(stderr, "cannot read the equalizer %s: receiving without it\n", o->eq);
+        return NULL;
+    }
+    printf("receiver equalizer: %s\n", o->eq);
+    return w;
+}
+
+/* --train-eq: learn from the burst --train-burst in the baseband kept by the first pass, save, decode again with it */
+static void train_and_redo(const opt_t *o, const int16_t *x, int n)
+{
+    if (!o->call[0]) {
+        printf("[!] --train-eq needs --call (the transmitter's callsign: it is part of the burst)\n");
+        return;
+    }
+    int nref;
+    int16_t *ref = make_burst(o->call, o->train_burst, o->frames, -10, NULL, 0, 1, &nref);
+    double w[TEQ_TAPS];
+    teq_report_t rp;
+    printf("\n=== learning the equalizer from B%d (%s, %d frames)\n", o->train_burst, o->call, o->frames);
+    bool ok = teq_train(s_bb, s_bb_n, ref, nref, w, &rp);
+    free(ref);
+    printf("  burst found at %.2f s (match %.2f), clock difference %+.1f ppm\n", rp.pos_s, rp.peak, rp.drift_ppm);
+    if (!ok) {
+        printf("[!] EQ: B%d was not found in the recording (match below 0.2): no equalizer saved\n", o->train_burst);
+        return;
+    }
+    printf("  error: gain only %.1f dB, with the equalizer %.1f dB (learned on half, other half: %.1f dB)\n",
+           rp.nmse_gain_db, rp.nmse_eq_db, rp.nmse_half_db);
+    teq_print_response(w);
+    char note[160];
+    snprintf(note, sizeof(note), "from B%d, error %.1f dB -> %.1f dB", o->train_burst, rp.nmse_gain_db, rp.nmse_eq_db);
+    if (!teq_save(o->train_eq, w, note)) {
+        printf("[!] cannot write %s\n", o->train_eq);
+        return;
+    }
+    printf("equalizer saved: %s\n", o->train_eq);
+    printf("\n=== the same recording again, with the equalizer\n");
+    s_bb_on = false;
+    rxpipe_t *p = rx_pipe(o->rx_af, w);
+    for (int i = 0; i < n; i += 960) {
+        rx_block(p, x + i, n - i < 960 ? n - i : 960);
+    }
+    rx_summary();
 }
 
 static int cmd_m17_tx(const opt_t *o)
@@ -939,9 +1116,24 @@ static int cmd_m17_tx(const opt_t *o)
                   { &guess, 50, -36, "precompensation, guess (HP 300 Hz order 2, no pre-emphasis, 50 Hz, -36 dB)" },
                   { &o->radio, o->floor_hz, o->pre_gain, "precompensation, your settings" } };
     int nb = o->b3 ? 3 : 2;
+    double txw[TEQ_TAPS];
+    if (o->tx_eq[0]) {
+        if (!o->b3) {
+            printf("[!] --tx-eq needs the B3 settings (--radio-hp ...): no B4\n");
+        } else if (!teq_load(o->tx_eq, txw)) {
+            printf("[!] cannot read the equalizer %s: no B4\n", o->tx_eq);
+        } else {
+            teq_unity_1k(txw);
+            nb = 4;
+        }
+    }
     printf("M17 test bursts from %s, %d frames (%.1f s) each, +3 symbols at %.1f dBFS before precompensation:\n",
            o->call, o->frames, o->frames * 0.04, o->level);
     for (int b = 0; b < nb; ++b) {
+        if (b == 3) {
+            printf("  B4: B3 + the equalizer %s (0 dB at 1 kHz)\n", o->tx_eq);
+            continue;
+        }
         printf("  B%d: %s", b + 1, plan[b].what);
         if (b == 2) {
             printf(" (HP %.0f Hz order %d, pre-emphasis %.0f us, floor %.0f Hz, %.0f dB)", o->radio.hp_hz,
@@ -953,7 +1145,24 @@ static int cmd_m17_tx(const opt_t *o)
     Sleep(3000);
     for (int b = 0; b < nb && !s_stop; ++b) {
         int n;
-        int16_t *x = make_burst(o->call, b + 1, o->frames, o->level, plan[b].r, plan[b].floor_hz, plan[b].gain, &n);
+        int pb = b == 3 ? 2 : b;                       /* B4: the B3 burst, then the equalizer */
+        int16_t *x = make_burst(o->call, b + 1, o->frames, o->level, plan[pb].r, plan[pb].floor_hz, plan[pb].gain, &n);
+        if (b == 3) {
+            teq_t q;
+            teq_init(&q, txw);
+            int16_t *y = calloc((size_t)n + TEQ_TAPS * TEQ_STRIDE, 2);
+            memcpy(y, x, (size_t)n * 2);
+            int m = n + TEQ_TAPS * TEQ_STRIDE / 2;     /* the equalizer delays by half its length: let it ring out */
+            teq_run(&q, y, m);
+            int clip = 0;
+            for (int i = 0; i < m; ++i) clip += y[i] == 32767 || y[i] == -32768;
+            if (clip) {
+                printf("  [W] burst 4: the equalizer clipped %d samples (lower --level)\n", clip);
+            }
+            free(x);
+            x = y;
+            n = m;
+        }
         printf("B%d ...\n", b + 1);
         transmit(o, x, n);
         free(x);
@@ -963,11 +1172,27 @@ static int cmd_m17_tx(const opt_t *o)
     return 0;
 }
 
+/* m17-ref: the bursts as m17-tx builds them, before any precompensation (for channel estimation offline) */
+static int cmd_m17_ref(const opt_t *o)
+{
+    for (int b = 1; b <= 3; ++b) {
+        int n;
+        int16_t *x = make_burst(o->call[0] ? o->call : "N0CALL", b, o->frames, -10, NULL, 0, 1, &n);
+        char path[64];
+        snprintf(path, sizeof(path), "ref_B%d.wav", b);
+        write_wav(path, x, n);
+        printf("wrote %s (%.2f s, +3 symbols at -10 dBFS)\n", path, (double)n / FS);
+        free(x);
+    }
+    return 0;
+}
+
 static int cmd_m17_rx(const opt_t *o)
 {
     printf("receiving %.0f s from input %d (%s): start m17-tx on the other radio (Ctrl+C ends early)\n", o->sec, o->in,
            o->rx_af ? "audio" : "12 kHz IF");
-    rxpipe_t *p = rx_pipe(o->rx_af);
+    s_bb_on = s_bb_path || o->train_eq[0];
+    rxpipe_t *p = rx_pipe(o->rx_af, rx_eq(o));
     int n = 0;
     int16_t *x = record(o, o->sec, &n, rx_block, p);
     if (!x) {
@@ -975,6 +1200,9 @@ static int cmd_m17_rx(const opt_t *o)
     }
     rx_summary();
     write_wav(o->wav[0] ? o->wav : "m17_rx.wav", x, n);
+    if (o->train_eq[0]) {
+        train_and_redo(o, x, n);
+    }
     free(x);
     return 0;
 }
@@ -991,11 +1219,15 @@ static int cmd_analyze(const char *what, const char *path, const opt_t *o)
     if (!strcmp(what, "tones")) {
         r = analyze_tones(x, n, o->rx_af, o->level);
     } else {
-        rxpipe_t *p = rx_pipe(o->rx_af);
+        s_bb_on = s_bb_path || o->train_eq[0];
+        rxpipe_t *p = rx_pipe(o->rx_af, rx_eq(o));
         for (int i = 0; i < n; i += 960) {
             rx_block(p, x + i, n - i < 960 ? n - i : 960);
         }
         rx_summary();
+        if (o->train_eq[0]) {
+            train_and_redo(o, x, n);
+        }
     }
     free(x);
     return r;
@@ -1045,7 +1277,7 @@ static int cmd_selftest(opt_t *o)
         const fmp_radio_t *r;
         double fl, g;
     } plan[3] = { { NULL, 0, 0 }, { &guess, 50, -36 }, { &mine, 50, -36 } };
-    rxpipe_t *p = rx_pipe(false);
+    rxpipe_t *p = rx_pipe(false, NULL);
     for (int b = 0; b < 3; ++b) {
         int nb;
         int16_t *bx = make_burst("N0CALL", b + 1, 60, -10, plan[b].r, plan[b].fl, plan[b].g, &nb);
@@ -1086,9 +1318,17 @@ int main(int argc, char **argv)
         usage();
         return 2;
     }
+    setvbuf(stdout, NULL, _IONBF, 0);              /* show progress at once when the output is a pipe (taikou-gui) */
     m17_rf_init();
     SetConsoleCtrlHandler(on_ctrl, TRUE);
     atexit(at_exit);
+    const char *stop_ev = getenv("TAIKOU_STOP_EVENT");
+    if (stop_ev && *stop_ev) {
+        HANDLE h = OpenEventA(SYNCHRONIZE, FALSE, stop_ev);
+        if (h) {
+            CloseHandle(CreateThread(NULL, 0, stop_watch, h, 0, NULL));
+        }
+    }
     opt_t o;
     memset(&o, 0, sizeof(o));
     o.in = o.out = -1;
@@ -1099,6 +1339,7 @@ int main(int argc, char **argv)
     o.level = 999;
     o.sec = 60;
     o.frames = 100;
+    o.train_burst = 3;
     fmp_radio_ic705_guess(&o.radio);
     o.floor_hz = 50;
     o.pre_gain = -36;
@@ -1126,6 +1367,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--wav")) { snprintf(o.wav, sizeof(o.wav), "%s", v); ++i; }
         else if (!strcmp(a, "--call")) { snprintf(o.call, sizeof(o.call), "%s", v); ++i; }
         else if (!strcmp(a, "--rx-af")) { o.rx_af = true; }
+        else if (!strcmp(a, "--bb")) { s_bb_path = v; ++i; }
+        else if (!strcmp(a, "--eq")) { snprintf(o.eq, sizeof(o.eq), "%s", v); ++i; }
+        else if (!strcmp(a, "--train-eq")) { snprintf(o.train_eq, sizeof(o.train_eq), "%s", v); ++i; }
+        else if (!strcmp(a, "--tx-eq")) { snprintf(o.tx_eq, sizeof(o.tx_eq), "%s", v); ++i; }
+        else if (!strcmp(a, "--train-burst")) { o.train_burst = atoi(v); ++i; }
+        else if (!strcmp(a, "--rx-gain")) { s_rx_gain = pow(10, atof(v) / 20); ++i; }
         else if (!strcmp(a, "--tx-delay")) { o.tx_delay_ms = (unsigned)atoi(v); ++i; }
         else if (!strcmp(a, "--max-tx")) { o.max_tx_s = atof(v); ++i; }
         else if (!strcmp(a, "--frames")) { o.frames = atoi(v); ++i; }
@@ -1168,6 +1415,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "no CI-V answer on %s (address %02X, %u bps): not transmitting\n", o.port, o.addr, o.baud);
             return 1;
         }
+        uint8_t c04[1] = { 0x04 }, c1a06[2] = { 0x1A, 0x06 };   /* the test is for FM-D only */
+        int nm = civ_query(c04, 1, b, sizeof(b));
+        bool fm = nm >= 1 && b[0] == 0x05;
+        int nd = civ_query(c1a06, 2, b, sizeof(b));
+        bool data = nd >= 1 && b[0];
+        if (!fm || !data) {
+            fprintf(stderr, "the radio on %s is not in FM-D (%s%s): press FM, then DATA. not transmitting\n", o.port,
+                    fm ? "FM" : "not FM", data ? ", data ON" : ", data off");
+            return 1;
+        }
     }
     if (o.level > 900) {
         o.level = !strcmp(cmd, "m17-tx") ? -10 : -20;
@@ -1179,6 +1436,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "tones-rx")) return cmd_tones_rx(&o);
     if (!strcmp(cmd, "m17-tx")) return cmd_m17_tx(&o);
     if (!strcmp(cmd, "m17-rx")) return cmd_m17_rx(&o);
+    if (!strcmp(cmd, "m17-ref")) return cmd_m17_ref(&o);
     if (!strcmp(cmd, "analyze") && a1) return cmd_analyze(a1, a2, &o);
     if (!strcmp(cmd, "selftest")) return cmd_selftest(&o);
     usage();
