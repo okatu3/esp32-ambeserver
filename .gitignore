@@ -29,6 +29,7 @@ sdkconfig.s3
 
 # M17 builds
 build_m17_pc/
+build_m17_pc_B/
 build_m17_modem_pc/
 m17_modem/esp32/build/
 m17_modem/esp32/sdkconfig
